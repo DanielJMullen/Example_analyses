@@ -1,0 +1,618 @@
+---
+title: "Expression Boxplots by Tumor Stage"
+author: "Daniel Mullen"
+date: "10/25/2021"
+output: html_document
+---
+
+Creating boxplots with ggplot2
+
+This will create boxplots for gene expression of a user-selected gene across groups determined by the clinical stage of the samples (with adjacent normal samples as a separate group). 
+
+First step is to install necessary packages:
+
+Using the if(!require()) notation for this should only install the packages if they aren't already installed. This should also call library() on each package as well.
+
+```{r}
+## Load BiocManager to install packages from Bioconductor
+## This will allow you to download other packages from Bioconductor:
+
+if (!require("BiocManager", quietly = TRUE)){
+  
+  install.packages("BiocManager")
+  
+}
+
+## Load ggplot2
+## This is the main graphing function you will be using - it can be a bit complex to master but gives you the most control over its presentation:
+if (!require('ggplot2')){
+  
+  BiocManager::install("ggplot2")
+}
+
+## Load EnvStats
+## EnvStats contains the stat_n_text function for ggplot2 to display group sizes in the boxplot:
+if (!require('EnvStats')){
+  
+  BiocManager::install("EnvStats")
+}
+
+## Load ggpubr
+## ggpubr contains the stat_pvalue_manual function for ggplot2 to display comparisons between the individual groups of interest:
+if (!require('ggpubr')){
+  
+  BiocManager::install("ggpubr")
+}
+```
+
+Next step is to load the TCGA LUAD dataset that will be used for this example:
+
+Please consult the TCGA_dataset_downloader script for information on how to 
+acquire the example datasets used in this tutorial. 
+
+```{r}
+## Replace the path to the .rda here with the location you  downloaded the .rda to on your system (that should be the path you set for the TENET_directory argument). 
+load("C:/Users/Danie/Desktop/luad_expression_methylation_FPKMUQexpression_log2normalizedexpression_nomatchingexpressionmethylation_deduplicatedtumor.rda")
+
+## Set the rownames of the clinical data to be the bcr patient barcodes:
+## This will help in grabbing clinical patient data and matching it to the expression data in a bit. 
+rownames(clinical) <- clinical$bcr_patient_barcode
+```
+
+Now let's specify the gene of interest for our barcodes:
+
+This is given by the gene's ENSG ID (in the form of ENSG###########). See my script on convert gene ENSGs to gene names and vice versa.
+
+```{r}
+## ENSG00000168484 corresponds to SFTPC. Change this to ENSG for your gene of interest. 
+gene_of_interest <- 'ENSG00000168484'
+```
+
+Now to create a boxplot, it is essential to construct a dataframe with each of the samples in the rows and all of the data used in our boxplot in the columns, including the expression values for our gene of interest as well as the groupings:
+
+```{r}
+## Let's start by getting the expression of the gene of interest, the raw clinical stage, and sample type (tumor vs normal) info for each sample:
+
+## For clinical_barcodes, we want to get the first 12 characters of each of the TCGA sample names in the expression data, because the clinical data we want to annotate to the expression data encodes the information in the first 12 characters matches the TCGA patient ID which the clinical data is annotated with. 
+
+## See https://docs.gdc.cancer.gov/Encyclopedia/pages/TCGA_Barcode/ for more info about patient barcodes. 
+expression_dataset <- data.frame(
+  'TCGA_barcodes'= c(
+    colnames(expDataT),
+    colnames(expDataN)
+  ),
+  'clinical_barcodes'= substring(
+    c(
+      colnames(expDataT),
+      colnames(expDataN)
+    ),
+    1,
+    12
+  ),
+  'gene_expression'= c(
+    unname(
+      unlist(
+        expDataT[
+          gene_of_interest,
+        ]
+      )
+    ),
+    unname(
+      unlist(
+        expDataN[
+          gene_of_interest,
+        ]
+      )
+    )
+  ),
+  'sample_type'= c(
+    rep(
+      'Tumor',
+      ncol(expDataT)
+    ),
+    rep(
+      'Normal',
+      ncol(expDataN)
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+## Now using the clinical_barcodes for the samples, get the stage information from the clinical data for each sample with expression data:
+expression_dataset$raw_clinical_stage <- as.character(
+  clinical[
+    expression_dataset$clinical_barcodes,
+    'stage_event_pathologic_stage'
+  ]
+)
+
+## Under the TCGA's annotation, the adjacent normal samples will still have a cancer stage annotated to them, because each of the adjacent normal samples was taken from a patient who did have a tumor resected, so they will receive the staging of that patient's tumor sample. 
+
+## Thus we will need to convert the  stage of these adjacent normal samples to "Normal" so they can be grouped together, separately from the different stages of tumor samples:
+expression_dataset$raw_clinical_stage_plus_normal <- ifelse(
+  expression_dataset$sample_type=='Normal',
+  'Normal',
+  expression_dataset$raw_clinical_stage
+)
+
+## Unfortunately there are also some samples where no data was recorded. This can be seen by running unique(expression_dataset$raw_clinical_stage) to see all the values present in the new raw_clinical_stage column. These values are listed as "". Unfortunately this will create problems later so we will convert these values to "Missing". 
+
+## Note that there may have been adjacent normal samples missing staging information, but their status as "Normal" samples overrrides that anyway, and these have already been converted to reflect that:
+expression_dataset$raw_clinical_stage_plus_normal_no_missing <- ifelse(
+  expression_dataset$raw_clinical_stage_plus_normal=='',
+  'Missing',
+  expression_dataset$raw_clinical_stage_plus_normal
+)
+
+## Now the stage we get from the clinical data is very nuanced, with samples having individual substages, i.e. Stage IIIA vs. IIIB for example. To make the boxplot more understandable, we want to condense these down to just Stages I, II, III, IV, and the non-tumor samples.
+
+## To do this, I could do a large nested ifelse tree to sort each of the substages. However instead I have opted to manually create a conversion table which directly converts each of the possible values in the new raw_clinical_stage column to the simple stage values. You can see all values of raw_clinical_stage you'll need to account for by running unique(expression_dataset$raw_clinical_stage_plus_normal_no_missing).
+stage_conversion_table <- data.frame(
+  'raw_stages'= sort(
+    unique(expression_dataset$raw_clinical_stage_plus_normal_no_missing),
+    decreasing = FALSE
+  ),
+  'conversion_stages'= c(
+    'Missing',
+    'Normal',
+    'Stage I',
+    'Stage I',
+    'Stage I',
+    'Stage II',
+    'Stage II',
+    'Stage II',
+    'Stage III',
+    'Stage III',
+    'Stage IV'
+  )
+)
+
+## We will also set the rownames to be the ordered raw_clinical_stage value to perform subsetting much more easily. 
+rownames(stage_conversion_table) <- stage_conversion_table$raw_stages
+
+## Now that we've created stage conversion table, and have already properly converted the adjacent normal and missing samples, let's use the table to simplify the stage grouping into 6 distinct groups: "Missing", "Normal", "Stage I", "Stage II", "Stage III", and "Stage IV"
+expression_dataset$final_clinical_stage <- stage_conversion_table[
+  expression_dataset$raw_clinical_stage_plus_normal_no_missing,
+  'conversion_stages'
+]
+
+## Now let's remove the samples that are missing stage information from the dataset, leaving us with 5 final catagories: "Normal", "Stage I", "Stage II", "Stage III", and "Stage IV". We will create a new dataset containing just those samples:
+samples_before_missing_removed_count <- nrow(
+  expression_dataset
+)
+
+expression_dataset_stage_present <- expression_dataset[
+  !expression_dataset$final_clinical_stage=='Missing',
+]
+
+missing_samples_removed_count <- samples_before_missing_removed_count-nrow(expression_dataset_stage_present)
+
+## Paste how many "Missing" samples were removed:
+paste(
+  'The number of tumor samples with missing stage info is:',
+  missing_samples_removed_count,
+  sep=' '
+)
+
+## Here the order of the levels will reflect their order in the boxplot, so we want to start with the "Normal" samples, then add the stages by increasing progression:
+expression_dataset_stage_present$final_clinical_stage_factor <- factor(
+  expression_dataset_stage_present$final_clinical_stage,
+  levels= c(
+    'Normal',
+    'Stage I',
+    'Stage II',
+    'Stage III',
+    'Stage IV'
+  )
+)
+```
+
+Now that we've set up the data frame containing the info for our boxplot, we will perform a one-way ANOVA to determine variance in expression between the different stages:
+
+```{r}
+## First step is to perform the ANOVA and save all the results to an object:
+stage_anova <- aov(
+  gene_expression~final_clinical_stage_factor,
+  data = expression_dataset_stage_present
+)
+
+## Let's see the overall p-value:
+## Remember for ANOVA this p-value will tell you if there is a statistically-significant difference between any of your groups, but not which ones.
+
+## We will also save this overall p-value to a variable, but round it to three digits after the decimal, along with scientific notation, to make it more cleanly display in our boxplot:
+ANOVA_p_value <- summary(stage_anova)[[1]][["Pr(>F)"]][[1]]
+
+paste(
+  'The overall ANOVA p-value is:',
+  ANOVA_p_value,
+  sep=' '
+)
+
+stage_anova_p <- formatC(
+  ANOVA_p_value,
+  format = "e",
+  digits = 3
+)
+
+## To see which groups show a statistically-significant difference between them you need to perform a post-hoc test like the Tukey test. We can show the results for that here, and save the results to a variable.
+TukeyHSD(stage_anova)
+stage_anova_tukey <- TukeyHSD(stage_anova)
+
+## To properly include the comparisons of interest in the boxplots later, we will need to reformat the data and add columns to make it into a version that stat_pvalue_manual can understand. To do this, we will grab the p-values for the groups of interest (in this case comparisons of the Normal group to each of the cancer stages).
+
+## First get the data for the comparisons of the normal group to the 4 cancer stages (the first 4 rows of the dataset).
+tukey_comparisons_of_interest <- as.data.frame(
+  stage_anova_tukey[[1]][c(1:4),]
+)
+
+# tukey_comparisons_of_interest$.y. <- rep(
+#   'gene_expression',
+#   nrow(tukey_comparisons_of_interest)
+# )
+
+## Add names for the two groups (contained in the rownames for ease of replicability).
+tukey_comparisons_of_interest$group1 <- sub(
+  '.*-', 
+  '', 
+  rownames(tukey_comparisons_of_interest)
+)
+
+tukey_comparisons_of_interest$group2 <- sub(
+  '-.*', 
+  '', 
+  rownames(tukey_comparisons_of_interest)
+)
+
+## Convert the Tukey p-values into astrisks based on their level of significance. For this I will use the ggpubr defaults: ns: p > 0.05, *: p <= 0.05, **: p <= 0.01, ***: p <= 0.001, ****: p <= 0.0001.
+tukey_comparisons_of_interest$p.signif <- ifelse(
+  tukey_comparisons_of_interest$`p adj`>0.05,
+  'ns',
+  ifelse(
+    tukey_comparisons_of_interest$`p adj`>0.01,
+    '*',
+    ifelse(
+      tukey_comparisons_of_interest$`p adj`>0.001,
+      '**',
+      ifelse(
+        tukey_comparisons_of_interest$`p adj`>0.0001,
+        '***',
+        '****'
+      )
+    )
+  )
+)
+
+## Finally we will need to add positioning of where to include the comparisons on the y-axis. This can be quite difficult to do without first seeing the plot of interest, you may want to run this code, create the boxplot for the gene of interest then come back to this code and adjust the y.position coordinates. This logic should provide a good rule of thumb based on the total spread of the expression values. These values will also come in handy later when setting the y-axis coordinates. 
+
+## First we will need to set the extent of the y-axis coordinates based on the expression of the gene of interest, and calculate one-tenth of it: 
+expression_min <- min(expression_dataset_stage_present$gene_expression)
+expression_max <- max(expression_dataset_stage_present$gene_expression)
+
+expression_spread_rounded <- ceiling(expression_max-expression_min)
+
+expression_spread_tenth <- (expression_spread_rounded/10)
+
+## Use those values now to set the positions of the group comparisons: 
+tukey_comparisons_of_interest$y.position <- c(
+  expression_max+expression_spread_tenth,
+  expression_max+(expression_spread_tenth*2),
+  expression_max+(expression_spread_tenth*3),
+  expression_max+(expression_spread_tenth*4)
+)
+```
+
+Now we will  specify colors for each of the groups to display in the boxplot.
+
+```{r}
+## I have elected to display the colors in greyscale - lower values of 'grey' indicate a darker grey, and that the values we set the colors for again match the levels of final_clinical_stage_factor.
+color_fill <- c(
+  'Normal'= 'white',
+  'Stage I'= 'grey80',
+  'Stage II'= 'grey60',
+  'Stage III'= 'grey40',
+  'Stage IV'= 'grey20'
+)
+```
+
+Finally we can move on to actually creating the plot(s):
+
+```{r}
+## First let's index a basic plot that we can build on to for the different versions I will show here.
+
+## The first part in this code designates our dataframe of information to look at for info to create the plot, with our y variable being the gene_expression, and the x variable being the clinical stage factor we created to define the 5 groups.
+
+## geom_boxplot() helps define the coloration of the plots, also designating the clinical stage factor to look at for how to color it.
+expression_plot <- ggplot(
+  expression_dataset_stage_present,
+  aes(
+    x = final_clinical_stage_factor, 
+    y = gene_expression
+  )
+) +
+geom_boxplot(
+  aes(fill = final_clinical_stage_factor)
+)
+
+## Now to the expression plot we'll add a title, noting the ENSG ID of the gene on the first line, and the overall ANOVA p-value (rounded) that we calculated earlier on the second line. The ylab and xlab parameters will label the X and Y axes. However the size and color of these labels are adjsted by the axis.title arguments near the end of this block of code. 
+
+## scale_y_continuous is the paramater that will probably need to be adjusted manually the most. This affects how large the y-axis stretches, and will also need to incorporate the later stat_n_text group size values below the boxes as well as the stat_compare_means comparisons above them. You can see the total spread of expression values by running summary(expression_dataset_stage_present$gene_expression). After that you will need to subtract about 10% of the total range of expression values below the lowest expression value for the stat_n_text values, and add about 40% of the range above the highest expression value to include the 4 comparisons we have done. For this plot, the total expression of SFTPC is 0 to 28.57, which I rounded to 0-30. From there I found that setting the total lim of scale_y_continuous from -3 to 42 fit the stat_n_text and stat_compare_means data. You can adjust the sublabels on the y-axis using the breaks argument. Here by specifying seq(0,30, by=2) I want labels for every point from 0,30, but only the even values (every 2 values shown).
+
+## guides(fill='none') prevents R from showing a legend of the groups to the right of the plot. I do not like including this legend because the groups are already labelled in the plot, so it just takes up space. 
+
+## As discussed previously, we can use the stat_pvalue_manual function to display the tukey_comparisons_of_interest dataset we made earlier. 
+
+## stat_n_text simply includes little boxes with n= the number of samples in each group below each group's boxplot. 
+
+## theme_bw() changes the plot to greyscale color
+
+## scale_fill_manual() lets us change the color of each group to the colors we specified earlier with color_fill.
+
+## Finally theme() has a number of parameters that can be adjusted. I use it to adjust the text size and color of the title, axis, and sub axis labels. I also turn off the major and minor gridlines by using element_blank() for those arguments. 
+
+## For these plots, their appearance will also depend on the size of your plotting window if using RStudio. So you can try changing the size of your plotting window there to change how the plot looks before you save it (which you can do with Export > save as image). Otherwise if looking at these scripts in the Rmarkdown file, you may need to click the 'show new window' option (it's at the top right of the plots below the block of script and looks like a very small excel file sheet).
+expression_plot +
+  ggtitle(
+    paste(
+      gene_of_interest,
+      ' Expression\n',
+      "Overall Anova p= ",
+      stage_anova_p,
+      sep=''
+    )
+  ) +
+  ylab("Gene expression [log2(FPKM-UQ)]") +
+  xlab("Sample Grouping") +
+  scale_y_continuous(
+    lim=c(-3,42),
+    breaks=seq(
+      0,
+      30,
+      by=2
+    )
+  ) +
+  guides(fill='none') +
+  stat_pvalue_manual(
+    data = tukey_comparisons_of_interest,
+    label= "p.signif",
+    size= 8
+  ) +
+ stat_n_text(
+    geom='label',
+    size=6
+  ) +
+  theme_bw() +
+  scale_fill_manual(values=color_fill)  +
+  theme(
+    plot.title = element_text(hjust=0.5, size=20),
+    panel.border = element_rect(colour = 'black', fill=NA, size=1),
+    axis.title.x = element_text(size=20, colour = 'black'),
+    axis.title.y = element_text(size=20, colour = 'black'),
+    axis.text.x = element_text(size=16, colour = 'black'),
+    axis.text.y = element_text(size=16, colour = 'black'),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+## This is a version of the plot I have tried to create where there is no need to set the y-axis parameters. However it requires a few particular tricks to get to work.
+
+## One trick we need is are functions to round up/down a given value to the next number divisible by a second value. This will be used to help set the upper and lower breaks in the number we want to sequence them along by:
+round_up <- function(x, y){
+  y*ceiling(x/y)
+}
+
+round_down <- function(x, y){
+  y*floor(x/y)
+}
+
+## We will also need way to rationally set the 'by' value for when determining breaks in the y-axis. In general I think using one tenth of the range, rounded down makes a good value. However if the value is less than 10, 0.5 works:
+break_value <- ifelse(
+  (expression_spread_rounded/10)<1,
+  0.5,
+  floor(expression_spread_rounded/10)
+)
+
+## Now let's create a very similar plot with all of the values set by "*^algorithm^*"
+expression_plot +
+  ggtitle(
+    paste(
+      gene_of_interest,
+      ' Expression\n',
+      "Overall Anova p= ",
+      stage_anova_p,
+      sep=''
+    )
+  ) +
+  ylab("Gene expression [log2(FPKM-UQ)]") +
+  xlab("Sample Grouping") +
+  scale_y_continuous(
+    lim=c(
+      (
+        round_down(
+          expression_min,
+          break_value
+        )-ceiling(expression_spread_tenth)
+      ),
+      round_up(
+        max(tukey_comparisons_of_interest$y.position),
+        break_value
+      )
+    ),
+    breaks=seq(
+      round_down(
+        expression_min,
+        break_value
+      ),
+      round_up(
+        expression_max,
+        break_value
+      ),
+      by=break_value
+    )
+  ) +
+  guides(fill='none') +
+  stat_pvalue_manual(
+    data = tukey_comparisons_of_interest,
+    label= "p.signif",
+    size= 8
+  ) +
+ stat_n_text(
+    geom='label',
+    size=6
+  ) +
+  theme_bw() +
+  scale_fill_manual(values=color_fill)  +
+  theme(
+    plot.title = element_text(hjust=0.5, size=20),
+    panel.border = element_rect(colour = 'black', fill=NA, size=1),
+    axis.title.x = element_text(size=20, colour = 'black'),
+    axis.title.y = element_text(size=20, colour = 'black'),
+    axis.text.x = element_text(size=16, colour = 'black'),
+    axis.text.y = element_text(size=16, colour = 'black'),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+## This is a more minimal version without the x and y axis titles and no stat_n_text values. Note that I adjusted the scale_y_continuous values slightly since I don't need to specify space below the groups for the stat_n_text values:
+expression_plot +
+  ggtitle(
+    paste(
+      gene_of_interest,
+      ' Expression\n',
+      "Overall Anova p= ",
+      stage_anova_p,
+      sep=''
+    )
+  ) +
+  ylab("Gene expression [log2(FPKM-UQ)]") +
+  xlab("Sample Grouping") +
+  scale_y_continuous(
+    lim=c(
+      round_down(
+        expression_min,
+        break_value
+      ),
+      round_up(
+        max(tukey_comparisons_of_interest$y.position),
+        break_value
+      )
+    ),
+    breaks=seq(
+      round_down(
+        expression_min,
+        break_value
+      ),
+      round_up(
+        expression_max,
+        break_value
+      ),
+      by=break_value
+    )
+  ) +
+  guides(fill='none') +
+  stat_pvalue_manual(
+    data = tukey_comparisons_of_interest,
+    label= "p.signif",
+    size= 8
+  ) +
+  theme_bw() +
+  scale_fill_manual(values=color_fill)  +
+  theme(
+    plot.title = element_text(hjust=0.5, size=20),
+    panel.border = element_rect(colour = 'black', fill=NA, size=1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size=18, colour = 'black'),
+    axis.text.y = element_text(size=16, colour = 'black'),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+Lastly, instead of just getting the image of the plot and saving it manually, you might also want to output it to an image or .pdf automatically. To do this, you will need to define a name of the output file, open an image/pdf, generate the plot you want, then close it.
+
+```{r}
+
+## First let's come up with a descriptive name for the file. To do this you'll first have to define a path to the folder you want to save the plot to. For this, remember to include the trailing '/'
+
+path_for_file <- "C:/Users/Danie/Desktop/"
+
+## Now to name the file proper, let's include the ENSG of of the gene:
+
+file_name <- paste(
+  gene_of_interest,
+  'expression_by_stage_boxplot.pdf',
+  sep='_'
+)
+
+## Now let's open a pdf with a specific size for the plot:
+pdf(
+  paste(
+    path_for_file,
+    file_name,
+    sep=''
+  ),
+  height= 7,
+  width= 10
+)
+
+## Now create the plot that we want:
+plot(
+  expression_plot +
+  ggtitle(
+    paste(
+      gene_of_interest,
+      ' Expression\n',
+      "Overall Anova p= ",
+      stage_anova_p,
+      sep=''
+    )
+  ) +
+  ylab("Gene expression [log2(FPKM-UQ)]") +
+  xlab("Sample Grouping") +
+  scale_y_continuous(
+    lim=c(
+      round_down(
+        expression_min,
+        break_value
+      ),
+      round_up(
+        max(tukey_comparisons_of_interest$y.position),
+        break_value
+      )
+    ),
+    breaks=seq(
+      round_down(
+        expression_min,
+        break_value
+      ),
+      round_up(
+        expression_max,
+        break_value
+      ),
+      by=break_value
+    )
+  ) +
+  guides(fill='none') +
+  stat_pvalue_manual(
+    data = tukey_comparisons_of_interest,
+    label= "p.signif",
+    size= 8
+  ) +
+  theme_bw() +
+  scale_fill_manual(values=color_fill)  +
+  theme(
+    plot.title = element_text(hjust=0.5, size=20),
+    panel.border = element_rect(colour = 'black', fill=NA, size=1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size=18, colour = 'black'),
+    axis.text.y = element_text(size=16, colour = 'black'),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+)
+
+## And then close the plot to generate it and save it:
+dev.off()
+```
+
