@@ -1,0 +1,717 @@
+---
+title: "Downloading TCGA data with expression and methylation data matching and duplicate removal"
+author: "Daniel Mullen"
+date: "11/22/2021"
+output: html_document
+---
+
+Downloading data from TCGA, matching samples with both methylation and expression data, and removing duplicate tumor samples taken from the same patient.
+
+The data contained here is largely a duplicate of the TCGA_downloader function in the TENETR package (which was also written by me, but at this time is private, so I am duplicating most of that function's analyses here). See https://github.com/rhielab/TENETR/blob/main/R/TCGA_downloader.R.
+
+The first step is to install necessary packages:
+
+Using the if(!require()) notation for this should only install the packages if they aren't already installed. This should also call library() on each package as well.
+
+```{r}
+## Load BiocManager to install packages from Bioconductor
+## This will allow you to download other packages from Bioconductor:
+
+if (!require("BiocManager", quietly = TRUE)){
+  
+  install.packages("BiocManager")
+  
+}
+
+## Load TCGAbiolinks
+## This is the main function that has a lot of useful functions making downloading and processing TCGA data a lot easier.
+if (!require('TCGAbiolinks')){
+  
+  BiocManager::install("TCGAbiolinks")
+}
+```
+
+The next step is to set the parameters we will use to define the type of TCGA data we want to download and how we want to process it and curate samples. These would normally be given as arguments to the TCGA_downloader function this script is based on, but here we will define them and use them to run blocks of codes since the function has been deconstructed. 
+
+```{r}
+## The first variable to define is the TCGA_directory. This should be a path to a directory on your computer in which you want the TCGA_biolinks package to download the raw files from TCGA. Note that these raw files can be quite large and can total as much as 100+ Gb for the largest TCGA datasets, so make sure these directory is located on a hard drive that has plenty of available space before starting.
+TCGA_directory <- 'C:/Users/Danie/TCGA_biolinks_data'
+
+## The next variable to define is the four letter TCGA study abbreviation. This specifies the TCGA dataset you wish to download. You can see the available list of datatypes here: https://gdc.cancer.gov/resources-tcga-users/tcga-code-tables/tcga-study-abbreviations though for this variable you will want to provide the 4 letters for the dataset you want listed under the "Study Abbreviation" column. 
+TCGA_study_abbreviation <- "LUAD"
+
+## Next is to specify the type of RNA-seq data you want to download. My function allows three options through TCGAbiolinks; "HTSeq - FPKM" downloads Fragments Per Kilobase Million normalized reads, and "HTSeq - FPKM-UQ" downloads Fragments Per Kilobase Million Upper Quartile normalized reads. You can read more about those two values and how they are calculated here: https://docs.gdc.cancer.gov/Data/Bioinformatics_Pipelines/Expression_mRNA_Pipeline/ . The final type of data that can be downladed is "HTSeq - Counts" data, which gives you the raw number of reads annotated to each gene. This type of data is not recommended to be used for differential gene expression analysis (at least without being normalized in some fashion), but could be useful in some way. 
+RNA_seq_workflow <- "HTSeq - FPKM-UQ"
+
+## Then, you'll have to determine if you want to perform log2 normalization of the values. To do this, specify RNA_seq_log2_normalization as TRUE if you want to do the log2 normalization, or FALSE if you do not.
+RNA_seq_log2_normalization <- TRUE
+
+## There are several ways we can match samples with gene expression data with those with DNA methylation data. We can either elect to keep all gene expression and DNA methylation data samples, even if a given sample doesn't necessarily have data of the other type. This can be done by setting the matching_exp_met_samples variable to "none". We can also only perform matching in tumor samples (of which there are a much greater number than the adjacent normal samples), this will exclude tumor samples which do not have both gene expression and DNA methylation data, but keep all the adjacent normal samples, even if they do not have both types of data. This can be done by setting matching_exp_met_samples variable to "tumor_only". Lastly, we can perform this matching on both tumor and adjacent normal samples, excluding those without both types of data in either sample set. This is done by setting matching_exp_met_samples to "tumor_and_normal".
+
+## Generally if you are working with both gene expression and DNA methylation data, I tend to perform matching on both datasets. However if working with only one data type, I would not perform matching. Here I am going to create a dataset with matched expression and methylation data.
+matching_exp_met_samples <- "tumor_and_normal"
+
+## To remove duplicate tumor samples, where there are multiple tumor tissue samples taken from the same patient, you can set remove_dup_tumor to be TRUE. This will keep the first sample listed alphanumerically by its TCGA barcode, and remove the others taken from the same patient. To keep all the tumor samples, set it to FALSE.
+remove_dup_tumor <- TRUE
+
+## Finally, you can select an output directory where you want a final .rda file containing the compiled gene expression, DNA methylation, and patient clinical information for the TCGA cancer type of interest to be placed. This file can be a few Gb in size (though a fraction of the size of the total raw files downloaded from the TCGA) so be aware of that:
+output_directory <- "C:/Users/Danie/Desktop/"
+```
+
+Now that you've set the initial variables for how you want to perform the analysis, we can start preparing to download the files and compile them. 
+
+The first step is to ensure that the given TCGA_directory and output_directory are in the proper format to ensure the files are named and deposited in the right directories. To do this, we will ensure that the given paths have a trailing '/' at the end.
+
+```{r}
+## If user has not supplied the final '/' in the TCGA and output directories, add them.
+TCGA_directory <- ifelse(
+  substring(
+    TCGA_directory,
+    nchar(TCGA_directory),
+    nchar(TCGA_directory)
+  ) == '/',
+  TCGA_directory,
+  paste(
+    TCGA_directory,
+    '/',
+    sep=''
+  )
+)
+
+output_directory <- ifelse(
+  substring(
+    output_directory,
+    nchar(output_directory),
+    nchar(output_directory)
+  ) == '/',
+  output_directory,
+  paste(
+    output_directory,
+    '/',
+    sep=''
+  )
+)
+```
+
+Then, let's make sure the TCGA study ID is properly formatted by making sure there is an all lowercase and all uppercase version of it, and also append 'TCGA-' to the front of it for TCGAdownloader to use, since the package requires the study abbreviation is given as 'TCGA-@@@@'.
+
+```{r}
+## Convert the supplied TCGA study abbreviation to an all caps and all lowercase version:
+TCGA_study_abbreviation_all_upper <- toupper(
+  TCGA_study_abbreviation
+)
+
+TCGA_study_abbreviation_all_lower <- tolower(
+  TCGA_study_abbreviation
+)
+
+## Create the TCGA abbreviation used for downloads with the TCGAbiolinks package:
+TCGA_study_abbreviation_download <- paste(
+  'TCGA-',
+  TCGA_study_abbreviation_all_upper,
+  sep=''
+)
+```
+
+Bbefore we start downloading files, we need to set the working directly to where we want the TCGA files downloaded to, which was given with the TCGA_directory argument. Then, create a query for the TCGAbiolinks package to grab the gene expression files for the TCGA dataset of interest and then download them. This query should already be mostly set up with the arguments we have previously defined (hence the formating of the RNA_seq_workflow function as an example). 
+
+Note that running this bit of code can take quite awhile if you haven't downloaded the files before.
+
+```{r}
+## First, change to the directory where the user wants files downloaded:
+setwd(TCGA_directory)
+
+## Set up the expression  query:
+expression_query <- TCGAbiolinks::GDCquery(
+  project= TCGA_study_abbreviation_download,
+  data.category= "Transcriptome Profiling",
+  data.type= "Gene Expression Quantification",
+  experimental.strategy= 'RNA-Seq',
+  workflow.type= RNA_seq_workflow,
+  legacy = FALSE
+)
+
+## Download the expression data
+TCGAbiolinks::GDCdownload(expression_query)
+```
+
+Now that the data is downloaded we need to compile each of the individual files downloaded per sample and combine them into a single gene expression dataset (for now, we will later divide it into datasets for tumor and adjacent normal samples). I prefer to do this using my own script rather than using TCGAbiolink's functions, because I have noticed TCGAbiolinks tends to be incredibly inefficient in how it puts these together. This will also perform log2 normalization of the expression files (which is recommended for TCGA FPKM values) if the user has selected it. 
+
+Note that running this bit of code can take quite a bit of time to compile the files, but includes a tracker to let you know how much of the dataset has been put together. 
+
+```{r}
+## To put together the gene expression dataset, first we want to get the expression pattern that files use, derived from the RNA_seq_workflow argument.
+expression_file_pattern <- sub(
+  '.*HTSeq - ',
+  '',
+  RNA_seq_workflow
+)
+
+## Then navigate to the directory that contains just the expression data for the analysis of interest we just downloaded.
+setwd(
+  paste(
+    TCGA_directory,
+    'GDCdata/',
+    TCGA_study_abbreviation_download,
+    '/harmonized/Transcriptome_Profiling/',
+    sep=''
+  )
+)
+
+## Next, list out all the downloaded expression files in the directory.
+expression_files_list_full_path <- list.files(
+  pattern= expression_file_pattern,
+  full.names= TRUE,
+  recursive= TRUE
+)
+
+## Get the barcode information from the expression query.
+expression_query_barcode_info <- expression_query$results[[1]]
+
+## Add the file names as rownames for the expression_query_barcode_info dataframe for easier matching to files later. 
+rownames(expression_query_barcode_info) <- expression_query_barcode_info$file_name
+
+## Now to actually create the dataset, we will use a for loop to go through each of the file names, take the info contained in them, and combine them into a single data frame called 'expression_data'.
+for(i in 1:length(expression_files_list_full_path)){
+
+  ## Load each file
+  file_placeholder <- read.delim(
+    expression_files_list_full_path[i],
+    header= FALSE,
+    sep='\t',
+    stringsAsFactors = FALSE
+  )
+
+  ## Get the base name of the file
+  file_name <- basename(expression_files_list_full_path[i])
+
+  ## Find the matching TCGA barcode to the file name:
+  TCGA_barcode <- expression_query_barcode_info[
+    file_name,
+    'cases'
+  ]
+
+  if(!exists('expression_data')){
+
+    ## If a expression file to compile info hasn't been created, create
+    ## it now and add the expression data from the first file to it.
+    expression_data <- data.frame(
+      'placeholder'=file_placeholder$V2
+    )
+
+    ## Then rename the first column to the sample name and the rownames
+    ## to be the gene names with the period and numbers after removed:
+    colnames(expression_data) <- TCGA_barcode
+    rownames(expression_data) <- sub(
+      '\\..*',
+      '',
+      file_placeholder$V1
+    )
+
+  } else{
+
+    ## If the dataset does already exist, take the gene expression values and add them as the nth new column, where n is the number of the   file that has been loaded.
+    expression_data[[i]] <- file_placeholder$V2
+
+    ## Change the column names to reflect the sample name of the newest file:
+    colnames(expression_data) <- c(
+      colnames(expression_data)[
+        1:(
+          length(
+            colnames(expression_data)
+          )-1
+        )
+      ],
+      TCGA_barcode
+    )
+  }
+
+  ## Return a message noting which percentage of the file has been combined:
+  proportion_completed <- (i/length(expression_files_list_full_path))
+
+  percentage_completed <- round(
+    (proportion_completed*100),
+    digits=2
+  )
+
+  cat(
+    'Expression dataset is ',
+    percentage_completed,
+    '% complete!',
+    '\n',
+    sep=''
+  )
+
+  ## Clear the workspace:
+  rm(file_placeholder)
+  rm(file_name)
+  rm(TCGA_barcode)
+  rm(proportion_completed)
+  rm(percentage_completed)
+}
+
+## Return a message noting the expression files have been compiled:
+cat('expression dataset compiled!')
+
+## Perform log2 normalization if the user has selected this:
+if(RNA_seq_log2_normalization==TRUE){
+
+  expression_data <- log2(expression_data+1)
+
+}
+
+## Return a message noting the expression files have been log2 transformed:
+cat('expression dataset log2 transformed!')
+```
+
+Now that the expression data is downloaded, let's download the methylation samples as well. This query should already be mostly set up with the arguments we have previously defined.
+
+Note that running this bit of code can take quite awhile if you haven't downloaded the files before, even longer than the expression files (since the methylation files for the 450k array are much larger than the expression datasets, by 7 times).
+
+```{r}
+## First, change back to the directory where the user wants files downloaded.
+setwd(TCGA_directory)
+
+## Then set up the methylation query.
+methylation_query <- TCGAbiolinks::GDCquery(
+  project= TCGA_study_abbreviation_download,
+  data.category= "DNA Methylation",
+  platform= "Illumina Human Methylation 450",
+  legacy= FALSE
+)
+
+## Download the methylation data using the methylation query. 
+TCGAbiolinks::GDCdownload(methylation_query)
+```
+
+Now that the methylation data is downloaded we need to compile each of the individual files downloaded per sample and combine them into a single DNA methylation dataset (for now, we will later divide it into datasets for tumor and adjacent normal samples). I prefer to do this using my own script rather than using TCGAbiolink's functions, because I have noticed TCGAbiolinks tends to be incredibly inefficient in how it puts these together.
+
+Note that running this bit of code can take quite a bit of time to compile the files, even longer than the respective code for the expression data, but includes a tracker to let you know how much of the dataset has been put together. 
+
+```{r}
+## Navigate to the directory that contains just the methylation data for the analysis of interest we just downloaded.
+setwd(
+  paste(
+    TCGA_directory,
+    'GDCdata/',
+    TCGA_study_abbreviation_download,
+    '/harmonized/DNA_Methylation/',
+    sep=''
+  )
+)
+
+## Next, list out all the downloaded methylation files in the directory.
+methylation_files_list_full_path <- list.files(
+  pattern='HumanMethylation450',
+  full.names = TRUE,
+  recursive= TRUE
+)
+
+## Now to actually create the dataset, we will use a for loop to go through each of the file names, take the info contained in them, and combine them into a single data frame called 'methylation_data'.
+for(i in 1:length(methylation_files_list_full_path)){
+
+  ## Load each file
+  file_placeholder <- read.delim(
+    methylation_files_list_full_path[i],
+    header= TRUE,
+    sep='\t',
+    stringsAsFactors = FALSE
+  )
+
+  ## Get the base name of the file
+  file_name <- basename(methylation_files_list_full_path[i])
+
+  ## Get part of file name starting with 'TCGA.'
+  file_name_TCGA <- substr(
+    file_name,
+    regexpr(
+      'TCGA',
+      file_name
+    ),
+    nchar(file_name)
+  )
+
+  ## Get part of file name before the period and remaining info. This should return the full sample name:
+  file_name_sample <- sub(
+    '\\..*',
+    '',
+    file_name_TCGA
+  )
+
+  if(!exists('methylation_data')){
+
+    ## If the methylation_data object to contain all samples' info hasn't been created, create it now and add the methylation data from the first file to it.
+    methylation_data <- data.frame(
+      'placeholder'=file_placeholder$Beta_value
+    )
+
+    ## Then rename the first column to the sample name and the rownames to be the probe names:
+    colnames(methylation_data) <- file_name_sample
+    rownames(methylation_data) <- file_placeholder$Composite.Element.REF
+
+  } else{
+
+        ## If the dataset does already exist, take the DNA methylation values and add them as the nth new column, where n is the number of the file that has been loaded.
+    methylation_data[[i]] <- file_placeholder$Beta_value
+
+    ## Change the column names to reflect the sample name of the newest file.
+    colnames(methylation_data) <- c(
+      colnames(methylation_data)[
+        1:(
+          length(
+            colnames(methylation_data)
+          )-1
+        )
+      ],
+      file_name_sample
+    )
+  }
+
+  ## Return a message noting which percentage of the file has been combined:
+  proportion_completed <- (i/length(methylation_files_list_full_path))
+
+  percentage_completed <- round(
+    (proportion_completed*100),
+    digits=2
+  )
+
+  cat(
+    'Methylation dataset is ',
+    percentage_completed,
+    '% complete!',
+    '\n',
+    sep=''
+  )
+
+  ## Clear the workspace
+  rm(file_placeholder)
+  rm(file_name)
+  rm(file_name_TCGA)
+  rm(file_name_sample)
+  rm(proportion_completed)
+  rm(percentage_completed)
+}
+
+## Return a message noting the methylation files have been compiled:
+cat('methylation dataset compiled!')
+```
+
+Now that we have created the expression and methylation datasets, the last thing we need to do is assemble the clinical data. We will again do this by navigating back to the directory where we want to download files to, then create a query for the clinical files. Finally, unlike for the expression and methylation datasets, we will us the TCGAbiolinks package's GDCprepare_clinic function to put the clinical files together into a dataset.
+
+```{r}
+## Change back to the directory where the user wants files downloaded:
+setwd(TCGA_directory)
+
+## Set up the clinical query:
+clinical_query <- TCGAbiolinks::GDCquery(
+  project= TCGA_study_abbreviation_download,
+  data.category= "Clinical",
+  file.type= "xml"
+)
+
+## Download the clinical data
+TCGAbiolinks::GDCdownload(
+  clinical_query
+)
+
+## Put the clinical data in a dataframe called 'clinical_data' for now. This uses the supressWarnings function due to a warning that pops up from TCGAbiolinks/dplyr usage, that otherwise doesn't affect its function.
+clinical_data <- suppressWarnings(
+  TCGAbiolinks::GDCprepare_clinic(
+    clinical_query,
+    clinical.info= "patient"
+  )
+)
+
+## Finally we will get the unique samples from the data since duplicate entries are included in the clinical data. 
+clinical <- unique(clinical_data)
+
+## Remove the uneeded clinical_data dataset.
+rm(clinical_data)
+```
+
+Now that we have assembled dataframes of gene expression, DNA methylation, and patient clinical data, we need to separate the expression and methylation datasets into ones for the tumor and adjacent normal samples and perform expression/methylation sample matching and duplicate sample removal as specified at the beginning of the script.
+
+First we will make sure the sample names in the columns of both the expression and methylation datasets are given as the first 19 characters of the TCGA barcode. This is the portion of each sample that matches between the gene expression and DNA methylation datasets. See here for more info about each part: https://docs.gdc.cancer.gov/Encyclopedia/pages/TCGA_Barcode/
+
+```{r}
+## Regardless of matching, cut down names of expression and methylation data to the first 19 characters:
+colnames(expression_data) <- substring(
+  colnames(expression_data),
+  1,
+  19
+)
+
+colnames(methylation_data) <- substring(
+  colnames(methylation_data),
+  1,
+  19
+)
+```
+
+Next, we will perform the gene expression and DNA methylation sample matching, where samples without both gene expression and DNA methylation data will be removed from the datasets (for either all samples, the tumor samples early, or no matching will be performed, depending on the options selected at the beginning of the script)
+
+```{r}
+## While the tumor and adjacent normal samples are still included together, if matching_exp_met_samples is set to 'tumor_and_normal', find both tumor and normal samples with just matched gene expression and DNA methylation data.
+if(matching_exp_met_samples=='tumor_and_normal'){
+
+  ## Find the sample names that are present in both datasets.
+  matched_exp_met_names <- intersect(
+    colnames(expression_data),
+    colnames(methylation_data)
+  )
+
+  ## Limit the expression and methylation data to just those samples.
+  expression_data <- expression_data[matched_exp_met_names]
+
+  methylation_data <- methylation_data[matched_exp_met_names]
+
+  ## Return a message noting the expression and methylation files have been matched.
+  cat('tumor and normal expression and methylation files have been matched!')
+
+}
+
+## Now let's isolate the tumor and normal samples. Tumor samples have 01-09 in their sample ID (characters 14 and 15) while normal samples have 10 -19. See: https://docs.gdc.cancer.gov/Encyclopedia/pages/TCGA_Barcode/
+expDataT <- expression_data[
+  as.numeric(
+    substring(
+      colnames(expression_data),
+      14,
+      15
+    )
+  ) < 10
+]
+
+expDataN <- expression_data[
+  as.numeric(
+    substring(
+      colnames(expression_data),
+      14,
+      15
+    )
+  ) >= 10
+]
+
+metDataT <- methylation_data[
+  as.numeric(
+    substring(
+      colnames(methylation_data),
+      14,
+      15
+    )
+  ) < 10
+]
+
+metDataN <- methylation_data[
+  as.numeric(
+    substring(
+      colnames(methylation_data),
+      14,
+      15
+    )
+  ) >= 10
+] 
+
+## Now that the samples have been split into normal and tumor dataets, if matching_exp_met_samples is set to 'tumor_only', perform the sample matching on just the tumor samples.
+if(matching_exp_met_samples=='tumor_only'){
+
+  ## Find the sample names that are present in both datasets:
+  matched_tumor_exp_met_names <- intersect(
+    colnames(expDataT),
+    colnames(metDataT)
+  )
+
+  ## Limit the expression and methylation data to just those samples:
+  expDataT <- expDataT[matched_tumor_exp_met_names]
+
+  metDataT <- metDataT[matched_tumor_exp_met_names]
+
+  ## Return a message noting the expression and methylation files have
+  ## been matched
+  cat('tumor expression and methylation files have been matched!')
+
+}
+```
+
+Next, let's remove duplicate samples as specified by the user, which will be done on an alphanumerical basis (i.e. the first sample, based on its alphanumeric TCGA barcode, from a given patient will be kept, and later ones will be removed).
+
+```{r}
+## First sort the samples of each dataset alphanumerically. Since R's duplicated() function identifies duplicates after the first unique entry in a given vector, this will allow us to keep the first unique entry alphanumerically.
+expDataN <- expDataN[
+  sort(
+    colnames(expDataN),
+    decreasing = FALSE
+  )
+]
+
+expDataT <- expDataT[
+  sort(
+    colnames(expDataT),
+    decreasing = FALSE
+  )
+]
+
+metDataN <- metDataN[
+  sort(
+    colnames(metDataN),
+    decreasing = FALSE
+  )
+]
+
+metDataT <- metDataT[
+  sort(
+    colnames(metDataT),
+    decreasing = FALSE
+  )
+]
+
+## Now if remove_dup_tumor is set to TRUE remove the tumor samples that are duplicates from the same patient (leaving one tumor sample per patient).
+if(remove_dup_tumor==TRUE){
+
+  ## Get the substring of the tumor sample names equal to the part of the barcode through the participant ID. See: https://docs.gdc.cancer.gov/Encyclopedia/pages/TCGA_Barcode/
+  expDataT_colnames_trunc <- substring(
+    colnames(expDataT),
+    1,
+    12
+  )
+
+  names(expDataT_colnames_trunc) <- colnames(expDataT)
+
+  metDataT_colnames_trunc <- substring(
+    colnames(metDataT),
+    1,
+    12
+  )
+
+  names(metDataT_colnames_trunc) <- colnames(metDataT)
+
+  ## Now remove the extra duplicate samples, leaving the first of each
+  expDataT_colnames_trunc_dup_removed <- expDataT_colnames_trunc[
+    !duplicated(expDataT_colnames_trunc)
+  ]
+
+  metDataT_colnames_trunc_dup_removed <- metDataT_colnames_trunc[
+    !duplicated(metDataT_colnames_trunc)
+  ]
+
+  ## Get get non-duplicated samples out of both the expression and methylation data:
+  expDataT <- expDataT[
+    names(expDataT_colnames_trunc_dup_removed)
+  ]
+
+  metDataT <- metDataT[
+    names(metDataT_colnames_trunc_dup_removed)
+  ]
+
+  ## Return a message noting the expression and methylation files deduplicated
+  cat('duplicate tumor samples have been removed!')
+
+}
+```
+
+Now let's save the data to an .rda file. This .rda file acts as an "image" of our R environment (with only the objects we select) and allows us to save multiple dataframes of information at once, such as the normal/tumor expression and methylation data, as well as the clinical data. This .rda file will also have a custom name based on the specific types of data we've included, so we can remember what sort of information is contained in it. Finally this .rda will be saved to the directory specified by the output_directory argument earlier. 
+
+```{r}
+## First, create an .rda output name based on the parameters selected:
+output_rda <- paste(
+  output_directory,
+  TCGA_study_abbreviation_all_lower,
+  '_expression_methylation',
+  sep=''
+)
+
+## Note the type of RNA data that was included in the name:
+if(RNA_seq_workflow=='HTSeq - Counts'){
+
+  output_rda <- paste(
+    output_rda,
+    '_countsexpression',
+    sep=''
+  )
+
+} else if(RNA_seq_workflow=='HTSeq - FPKM'){
+
+  output_rda <- paste(
+    output_rda,
+    '_FPKMexpression',
+    sep=''
+  )
+
+} else if(RNA_seq_workflow=='HTSeq - FPKM-UQ'){
+
+  output_rda <- paste(
+    output_rda,
+    '_FPKMUQexpression',
+    sep=''
+  )
+}
+
+## If the data was log2 transformed, add that to the name:
+if(RNA_seq_log2_normalization==TRUE){
+
+  output_rda <- paste(
+    output_rda,
+    '_log2normalizedexpression',
+    sep=''
+  )
+}
+
+## If the methylation and expression samples were matched for both tumor and normal samples add that to the name:
+if(matching_exp_met_samples=='tumor_and_normal'){
+
+  output_rda <- paste(
+    output_rda,
+    '_matchedtumorandnormalexpressionmethylation',
+    sep=''
+  )
+}
+
+## If the methylation and expression samples were matched for only tumor samples add that to the name:
+if(matching_exp_met_samples=='tumor_only'){
+
+  output_rda <- paste(
+    output_rda,
+    '_matchedtumoronlyexpressionmethylation',
+    sep=''
+  )
+}
+
+## If no methylation and expression matching was performed add that to the name:
+if(matching_exp_met_samples=='none'){
+
+  output_rda <- paste(
+    output_rda,
+    '_nomatchingexpressionmethylation',
+    sep=''
+  )
+}
+
+## If the tumor samples were deduplicated, add that to the name:
+if(remove_dup_tumor==TRUE){
+
+  output_rda <- paste(
+    output_rda,
+    '_deduplicatedtumor',
+    sep=''
+  )
+}
+
+## Add the .rda to the end:
+output_rda <- paste(
+  output_rda,
+  '.rda',
+  sep=''
+)
+
+## Save these objcts, plus clinical data
+## to an rda file exported to the specified
+## TENET_directory:
+save(
+  clinical,
+  expDataN,
+  expDataT,
+  metDataN,
+  metDataT,
+  file= output_rda
+)
+```
+

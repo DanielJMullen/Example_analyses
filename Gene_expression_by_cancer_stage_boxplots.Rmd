@@ -47,12 +47,12 @@ if (!require('ggpubr')){
 
 Next step is to load the TCGA LUAD dataset that will be used for this example:
 
-Please consult the TCGA_dataset_downloader script for information on how to 
+Please consult the TCGA_data_downloading_with_sample_matching_and_duplicate_removal script for information on how to 
 acquire the example datasets used in this tutorial. 
 
 ```{r}
-## Replace the path to the .rda here with the location you  downloaded the .rda to on your system (that should be the path you set for the TENET_directory argument). 
-load("C:/Users/Danie/Desktop/luad_expression_methylation_FPKMUQexpression_log2normalizedexpression_nomatchingexpressionmethylation_deduplicatedtumor.rda")
+## Replace the path to the .rda here with the location you  downloaded the .rda to on your system (that should be the path you set for the output_directory argument in the TCGA_data_downloading_with_sample_matching_and_duplicate_removal script). 
+load("C:/Users/Danie/Desktop/luad_expression_methylation_FPKMUQexpression_log2normalizedexpression_matchedtumorandnormalexpressionmethylation_deduplicatedtumor.rda")
 
 ## Set the rownames of the clinical data to be the bcr patient barcodes:
 ## This will help in grabbing clinical patient data and matching it to the expression data in a bit. 
