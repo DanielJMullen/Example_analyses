@@ -1,0 +1,2027 @@
+---
+title: "Gene_expression_and_DNA_methylation_patient_survival_analysis"
+author: "Daniel Mullen"
+date: "1/4/2022"
+output: html_document
+---
+
+Performing Kaplan-Meier, Cox Proportional Hazards, and random forest survival modeling
+
+This script will perform survival analysis three ways. The first is to do a Kaplan-Meier survival analysis which will also output a survival curve plot. The second is to do a Cox Proportional Hazards survival regression model which will include basic variables (age, gender, smoking history, race) in the analysis. The third analysis is to use a random forest based approach that also includes basic variables (age, gender, smoking history, race) in the analysis. Kaplan Meier survival plots as well as tables of information for both Kaplan-Meier and Cox Porportional Hazards models will be output to a directory for each of the genes specified by the user. Plots for each will be generated for a given list of genes by gene ENSG IDs, and DNA methylation probes by their cg######## annotation. 
+
+First step is to install necessary packages:
+
+Using the if(!require()) notation for this should only install the packages if they aren't already installed. This should also call library() on each package as well.
+
+Note, I have found that sometimes it takes running this section twice to get packages to properly install and load. 
+
+```{r}
+## Load the survival package, which includes the functions to perform survival analyses for all three survival analysis types.
+if (!require("survival", quietly = TRUE)){
+  
+  install.packages("survival")
+  
+}
+
+if (!require("ranger", quietly = TRUE)){
+  
+  install.packages("ranger")
+  
+}
+```
+
+Now since we want to save plots and tables to the computer, we will need to specify a path for where to save them:
+
+```{r}
+## Set the path to a directory where you want the boxplots for each of the genes saved:
+path_for_files <- "C:/Users/Danie/Desktop/"
+
+## Make sure that the path_for_file ends in a '/'
+path_for_files <- ifelse(
+  substring(
+    path_for_files,
+    nchar(path_for_files),
+    nchar(path_for_files)
+  ) == '/',
+  path_for_files,
+  paste(
+    path_for_files,
+    '/',
+    sep=''
+  )
+)
+```
+
+Then, load the TCGA LUAD dataset that will be used for this example:
+
+Please consult the TCGA_data_downloading_with_sample_matching_and_duplicate_removal script for information on how to 
+acquire the example datasets used in this tutorial. In this case we will be using the unmatched sample dataset since we are only working with either the gene expression data or the methylation data by itself and want to maximize sample sizes. 
+
+```{r}
+## Replace the path to the .rda here with the location you downloaded the .rda to on your system (that should be the path you set for the output_directory argument in the TCGA_data_downloading_with_sample_matching_and_duplicate_removal script). 
+load("C:/Users/Danie/Desktop/luad_expression_methylation_FPKMUQexpression_log2normalizedexpression_nomatchingexpressionmethylation_deduplicatedtumor.rda")
+
+## Set the rownames of the clinical data to be the bcr patient barcodes:
+## This will help in grabbing clinical patient data and matching it to the expression/methylation data in a bit. 
+rownames(clinical) <- clinical$bcr_patient_barcode
+```
+
+Now let's specify the genes of interest and DNA methylation probes of interest for our survival analyses:
+
+This is given by the genes' ENSG IDs (in the form of ENSG###########) in a vector. See my script on convert gene ENSGs to gene names and vice versa.
+
+We will also give the DNA methylation probes by their probe ID (in the form of cg########) in a vector:
+
+```{r}
+## List the ENSG IDs for the genes of interest. ENSG00000111206 is FOXM1, ENSG00000101057 is MYBL2, and ENSG00000115163 is CENPA.
+genes_of_interest <- c(
+  'ENSG00000111206',
+  'ENSG00000101057',
+  'ENSG00000115163'
+)
+
+## Now lets list the probe IDs for the DNA methylation probe IDs of interest.
+probes_of_interest <- c(
+  'cg03535253',
+  'cg06956006',
+  'cg04016113',
+  'cg09580922'
+)
+```
+
+For Kaplan-Meier survival analyses, we also need to set thresholds for which to place samples in a "low" and "high" group for comparison. To do this, we can set 'low_thresh' and 'high_thresh' variables for both methylation and expression, with values that range from 0 to 1. The 'low_thresh' value will set the "low" samples, up to and equal to the proportion value specified by the variable (so setting it to 0.25 will include the lowest quartile of samples, and setting it to 0.5 will grab the lowest half). On the flip side, the 'high_thresh' value will specify the "high" group by including all the samples above the given proportion value (so setting this to 0.5 will grab the highest half of samples, and setting it to 0.75 would grab the highest quartile).
+
+```{r}
+## Set the proportional thresholds for the expression and methylation samples. These numbers should be set between 0 and 1 and shouldn't overlap with each other (equal to each other is ok):
+expression_KM_low_thresh <- (1/4)
+
+expression_KM_high_thresh <- (3/4)
+
+methylation_KM_low_thresh <- (1/4)
+
+methylation_KM_high_thresh <- (3/4)
+```
+
+Now to perform the survival analyses, we will create two different dataframes for the gene expression and DNA methylation analyses (so 4 total). 
+
+Each dataframe will include the samples in the rows, and the data of interest in the columns. This includes the expression of each of the genes of interest, or the methylation of each of the probes of interest, as well as the three pieces of clinical data necessary for survival analyses (days until death, days to last followup, and patient vital status at the end of the observation period). 
+
+To one the gene expression and methylation datasets for use with Cox regression analysis, we will add additional clinical variables (and then filter out samples that lack this data).
+
+```{r}
+## This will be a big block of code because we have a lot of steps to work on here. 
+
+## Let's start by including the full sample barcodes and clinical barcodes.
+
+## For clinical_barcodes, we want to get the first 12 characters of each of the TCGA sample names in the expression data, because the clinical data we want to annotate to the expression data encodes the information in the first 12 characters matches the TCGA patient ID which the clinical data is annotated with. 
+
+## See https://docs.gdc.cancer.gov/Encyclopedia/pages/TCGA_Barcode/ for more info about patient barcodes. 
+expression_dataset <- data.frame(
+  'TCGA_barcodes'= colnames(expDataT),
+  'clinical_barcodes'= substring(
+    colnames(expDataT),
+    1,
+    12
+  ),
+  stringsAsFactors = FALSE
+)
+
+methylation_dataset <- data.frame(
+  'TCGA_barcodes'= colnames(metDataT),
+  'clinical_barcodes'= substring(
+    colnames(metDataT),
+    1,
+    12
+  ),
+  stringsAsFactors = FALSE
+)
+
+## Now let's add the expression of all the genes of interest, or the methylation of all the probes of interest using for loops:
+
+## Now for each gene in the vector, get it's expression and and them to the expression dataset with a for loop.
+for(gene in genes_of_interest){
+  
+  ## For each gene, get it's expression from the tumor samples and add it as a column to the expression dataframe with the ENSG ID of the gene.
+  expression_dataset[gene] <- unname(
+    unlist(
+      expDataT[
+        gene,
+      ]
+    )
+  )
+}
+
+## Now for each probe in the vector, get it's methylation and and them to the methylation dataset with a for loop.
+for(probe in probes_of_interest){
+  
+  ## For each probe, get it's methylation from the tumor samples and add it as a column to the methylation dataframe by the ID of the probe.
+  methylation_dataset[probe] <- unname(
+    unlist(
+      metDataT[
+        probe,
+      ]
+    )
+  )
+}
+
+## Now that we have the barcodes and expression/methylation values, let's add the clinical variables of interest for survival, as well as covariates that will later be used in the Cox survival analyses. 
+
+## For the general survival analyses, we will need to grab the "days_to_death", "days_to_last_followup", and "vital_status" variables from the clinical data. 
+expression_dataset$days_to_death <- clinical[
+  expression_dataset$clinical_barcodes,
+  'days_to_death'
+]
+
+expression_dataset$days_to_last_followup <- clinical[
+  expression_dataset$clinical_barcodes,
+  'days_to_last_followup'
+]
+
+expression_dataset$vital_status <- clinical[
+  expression_dataset$clinical_barcodes,
+  'vital_status'
+]
+
+methylation_dataset$days_to_death <- clinical[
+  methylation_dataset$clinical_barcodes,
+  'days_to_death'
+]
+
+methylation_dataset$days_to_last_followup <- clinical[
+  methylation_dataset$clinical_barcodes,
+  'days_to_last_followup'
+]
+
+methylation_dataset$vital_status <- clinical[
+  methylation_dataset$clinical_barcodes,
+  'vital_status'
+]
+
+## Since these variables will be used in both the Kaplan-Meier and Cox regression survival analyses, let's format them now:
+
+## Now let's make sure the 'days_to_death' and 'days_to_last_followup' variables are numeric and are properly formatted:
+expression_dataset$days_to_death <- as.numeric(
+  as.character(expression_dataset$days_to_death)
+)
+
+expression_dataset$days_to_last_followup <- as.numeric(
+  as.character(expression_dataset$days_to_last_followup)
+)
+
+methylation_dataset$days_to_death <- as.numeric(
+  as.character(methylation_dataset$days_to_death)
+)
+
+methylation_dataset$days_to_last_followup <- as.numeric(
+  as.character(methylation_dataset$days_to_last_followup)
+)
+
+## Now let's create a 'time' variable equal to 'days_to_death' for deceased individual samples, and 'days_to_last_followup' for living individual samples
+expression_dataset$time <- ifelse(
+  expression_dataset$vital_status=='Alive',
+  expression_dataset$days_to_last_followup,
+  ifelse(
+    expression_dataset$vital_status=='Dead',
+    expression_dataset$days_to_death,
+    NA
+  )
+)
+
+methylation_dataset$time <- ifelse(
+  methylation_dataset$vital_status=='Alive',
+  methylation_dataset$days_to_last_followup,
+  ifelse(
+    methylation_dataset$vital_status=='Dead',
+    methylation_dataset$days_to_death,
+    NA
+  )
+)
+
+## Now we will need to remove samples that lack the proper survival information from both analysis types. At this point since no samples have been removed yet, we'll take note of how many samples we had to start in each dataset, and track how many have been removed from the dataset for different regions:
+
+## Get the starting sample totals and also output it to the console:
+expression_starting_sample_total <- nrow(expression_dataset)
+
+paste(
+  "Number of expression samples to start:",
+  expression_starting_sample_total,
+  sep=' '
+)
+
+methylation_starting_sample_total <- nrow(methylation_dataset)
+
+paste(
+  "Number of methylation samples to start:",
+  methylation_starting_sample_total,
+  sep=' '
+)
+
+expression_dataset <- expression_dataset[
+  !is.na(
+    expression_dataset[,"time"]
+  ),
+]
+
+methylation_dataset <- methylation_dataset[
+  !is.na(
+    methylation_dataset[,"time"]
+  ),
+]
+
+## It was also found that some samples seem to have data in both the 'days_to_death' and 'days_to_last_followup' columns, however looking at the data, it seems that these samples are always deceased patients, and their days_to_last_followup values are less than or equal to their days_to_death value. Based on the definition of the terms from https://cdebrowser.nci.nih.gov/cdebrowserClient/cdeBrowser.html#/search (see later section on smoking history for more info on this information) these don't necessarily need to be mutually exclusive, though most samples that are deceased are NA for days_to_last_followup, and vice-versa for patients that are still alive. For now I will leavet the samples in the dataset, but you can look at them and remove them by uncommenting the following lines of code:
+# expression_dataset[
+#   (!is.na(expression_dataset[,"days_to_death"]) & !is.na(expression_dataset[,"days_to_last_followup"])),
+# ]
+#
+# methylation_dataset[
+#   (!is.na(methylation_dataset[,"days_to_death"]) & !is.na(methylation_dataset[,"days_to_last_followup"])),
+# ]
+# 
+# expression_dataset <- expression_dataset[
+#   !(!is.na(expression_dataset[,"days_to_death"]) & !is.na(expression_dataset[,"days_to_last_followup"])),
+# ]
+#
+# methylation_dataset <- methylation_dataset[
+#   !(!is.na(methylation_dataset[,"days_to_death"]) & !is.na(methylation_dataset[,"days_to_last_followup"])),
+# ]
+
+## Let's identify the number of samples that were lost due to a lack of proper survival information and return that number to the console:
+expression_samples_without_survival_info_total <- (
+  expression_starting_sample_total -
+  nrow(expression_dataset)
+)
+
+paste(
+  "Number of expression samples removed due to lack of survival information:",
+  expression_samples_without_survival_info_total,
+  sep=' '
+)
+
+methylation_samples_without_survival_info_total <- (
+  methylation_starting_sample_total -
+  nrow(methylation_dataset)
+)
+
+paste(
+  "Number of methylation samples removed due to lack of survival information:",
+  methylation_samples_without_survival_info_total,
+  sep=' '
+)
+
+## For Cox regression analyses, I will grab the variables "stage_event_pathologic_stage" for the stage of the tumors at biopsy, "age_at_initial_pathologic_diagnosis" for the patients' age at biopsy, "gender" for the patients' reported gender, and "race_list" for the patients' race. I will also get "tobacco_smoking_history" to derive the patients' tobacco smoking history. 
+
+## These 5 variables will be included as covariates in the survival model, and for the Cox regression analyses, we will filter out samples missing data for these variables. However, because we do not need to filter out these variables for the Kaplan-Meier survival analyses, at this point we will create a copy of our datasets to subtract samples from for only the Cox regression analyses:
+
+## Create dataframes to contain information for the Cox Regression analyses, and rename the old dataframes to reflect their use in Kaplan-Meier analyses, then remove the old dataset from memory to clear the workspace 
+expression_dataset_KM <- expression_dataset
+
+expression_dataset_CR <- expression_dataset
+
+rm(expression_dataset)
+
+methylation_dataset_KM <- methylation_dataset
+
+methylation_dataset_CR <- methylation_dataset
+
+rm(methylation_dataset)
+
+## Let's first start by processing the cancer stage information, first by adding the raw cancer stage information, which is given in the 'stage_event_pathologic_stage' column. We will wrap this in an as.character() function to ensure the data isn't imported as a factor (we can change it back into a factor of our own design in a later section of code):
+expression_dataset_CR$raw_clinical_stage <- as.character(
+  clinical[
+    expression_dataset_CR$clinical_barcodes,
+    'stage_event_pathologic_stage'
+  ]
+)
+
+methylation_dataset_CR$raw_clinical_stage <- as.character(
+  clinical[
+    methylation_dataset_CR$clinical_barcodes,
+    'stage_event_pathologic_stage'
+  ]
+)
+
+## Unfortunately there are some samples where no data was recorded for the cancer stage. This can be seen by running unique(expression_dataset_CR$raw_clinical_stage) to see all the values present in the new raw_clinical_stage column. These values are listed as "". Unfortunately this will create problems later so we will convert these values to "Missing". 
+expression_dataset_CR$raw_clinical_stage_no_missing <- ifelse(
+  expression_dataset_CR$raw_clinical_stage=='',
+  'Missing',
+  expression_dataset_CR$raw_clinical_stage
+)
+
+methylation_dataset_CR$raw_clinical_stage_no_missing <- ifelse(
+  methylation_dataset_CR$raw_clinical_stage=='',
+  'Missing',
+  methylation_dataset_CR$raw_clinical_stage
+)
+
+## Now the stage we get from the clinical data is very nuanced, with samples having individual substages, i.e. Stage IIIA vs. IIIB for example. We want to condense these down to just Stages I, II, III, and IV. 
+
+## To do this, we can strip the 'A' or 'B' from the stage using a sub() argument:
+expression_dataset_CR$final_clinical_stage <- sub(
+  '[AB].*', 
+  '', 
+  expression_dataset_CR$raw_clinical_stage_no_missing
+)
+
+methylation_dataset_CR$final_clinical_stage <- sub(
+  '[AB].*', 
+  '', 
+  methylation_dataset_CR$raw_clinical_stage_no_missing
+)
+
+## Now let's remove the samples that are missing stage information from the dataset, leaving us with 4 final catagories: "Stage I", "Stage II", "Stage III", and "Stage IV" and record how many samples lacked that info and were removed and report that to the console as well:
+expression_samples_before_cancer_stage_info_removed <- nrow(expression_dataset_CR)
+
+methylation_samples_before_cancer_stage_info_removed <- nrow(methylation_dataset_CR)
+
+expression_dataset_CR <- expression_dataset_CR[
+  expression_dataset_CR$final_clinical_stage!='Missing',
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  methylation_dataset_CR$final_clinical_stage!='Missing',
+]
+
+expression_samples_without_cancer_stage_info <- (expression_samples_before_cancer_stage_info_removed - nrow(expression_dataset_CR))
+
+methylation_samples_without_cancer_stage_info <- (methylation_samples_before_cancer_stage_info_removed - nrow(methylation_dataset_CR))
+
+paste(
+  "Number of expression samples removed due to lack of cancer stage information:",
+  expression_samples_without_cancer_stage_info,
+  sep=' '
+)
+
+paste(
+  "Number of methylation samples removed due to lack of cancer stage information:",
+  methylation_samples_without_cancer_stage_info,
+  sep=' '
+)
+
+## Let's clean up a bit by removing the number of samples before cancer stage info removed count:
+rm(expression_samples_before_cancer_stage_info_removed)
+
+rm(methylation_samples_before_cancer_stage_info_removed)
+
+## Let's now add gender information. We will wrap this in an as.character() function to ensure the data isn't imported as a factor (we can change it back into a factor of our own design in a later section of code):
+expression_dataset_CR$final_gender <- as.character(
+  clinical[
+    expression_dataset_CR$clinical_barcodes,
+    'gender'
+  ]
+)
+
+methylation_dataset_CR$final_gender <- as.character(
+  clinical[
+    methylation_dataset_CR$clinical_barcodes,
+    'gender'
+  ]
+)
+
+## Let's remove any samples that aren't MALE or FEMALE (unfortunately we are more concerned about catching missing samples than accurately recording subjects of non-binary gender) and record how many samples lacked proper info and were removed and report that to the console as well:
+expression_samples_before_gender_info_removed <- nrow(expression_dataset_CR)
+
+methylation_samples_before_gender_info_removed <- nrow(methylation_dataset_CR)
+
+expression_dataset_CR <- expression_dataset_CR[
+  expression_dataset_CR$final_gender %in% c('MALE','FEMALE'),
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  methylation_dataset_CR$final_gender %in% c('MALE','FEMALE'),
+]
+
+expression_samples_without_gender_info <- (expression_samples_before_gender_info_removed - nrow(expression_dataset_CR))
+
+methylation_samples_without_gender_info <- (methylation_samples_before_gender_info_removed - nrow(methylation_dataset_CR))
+
+paste(
+  "Number of expression samples removed due to lack of gender information:",
+  expression_samples_without_gender_info,
+  sep=' '
+)
+
+paste(
+  "Number of methylation samples removed due to lack of gender information:",
+  methylation_samples_without_gender_info,
+  sep=' '
+)
+
+## Let's clean up a bit by removing the number of samples before genderinfo removed count:
+rm(expression_samples_before_gender_info_removed)
+
+rm(methylation_samples_before_gender_info_removed)
+
+## Let's now get age information:
+expression_dataset_CR$final_age <- clinical[
+  expression_dataset_CR$clinical_barcodes,
+  'age_at_initial_pathologic_diagnosis'
+]
+
+methylation_dataset_CR$final_age <- clinical[
+  methylation_dataset_CR$clinical_barcodes,
+  'age_at_initial_pathologic_diagnosis'
+]
+
+## Let's remove any samples are missing age information or have NA values, then record the number of samples that were removed due to missing age information and report that number to the console.
+expression_samples_before_age_info_removed <- nrow(expression_dataset_CR)
+
+methylation_samples_before_age_info_removed <- nrow(methylation_dataset_CR)
+
+expression_dataset_CR <- expression_dataset_CR[
+  !is.na(expression_dataset_CR$final_age),
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  !is.na(methylation_dataset_CR$final_age),
+]
+
+expression_dataset_CR <- expression_dataset_CR[
+  expression_dataset_CR$final_age!='',
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  methylation_dataset_CR$final_age!='',
+]
+
+expression_dataset_CR <- expression_dataset_CR[
+  expression_dataset_CR$final_age!=' ',
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  methylation_dataset_CR$final_age!=' ',
+]
+
+expression_samples_without_age_info <- (expression_samples_before_age_info_removed - nrow(expression_dataset_CR))
+
+methylation_samples_without_age_info <- (methylation_samples_before_age_info_removed - nrow(methylation_dataset_CR))
+
+paste(
+  "Number of expression samples removed due to lack of age information:",
+  expression_samples_without_age_info,
+  sep=' '
+)
+
+paste(
+  "Number of methylation samples removed due to lack of age information:",
+  methylation_samples_without_age_info,
+  sep=' '
+)
+
+## Let's clean up a bit by removing the number of samples before age info removed count:
+rm(expression_samples_before_age_info_removed)
+
+rm(methylation_samples_before_age_info_removed)
+
+## Now let's include smoking history data. 
+
+## The smoking history data is encoded in the 'tobacco smoking history' variable in the clinical data, but the smoking history categories are recorded as numbers. To see what the numbers correspond to, see https://cdebrowser.nci.nih.gov/cdebrowserClient/cdeBrowser.html#/search . Go to Public ID search and use the CDE value (2181650) and use the value domain and value meaning tabs for more info:
+
+## We will start by adding this number to the datasets:
+expression_dataset_CR$raw_tobacco_smoking_history <- as.numeric(
+  clinical[
+    expression_dataset_CR$clinical_barcodes,
+    'tobacco_smoking_history'
+  ]
+)
+
+methylation_dataset_CR$raw_tobacco_smoking_history <- as.numeric(
+  clinical[
+    methylation_dataset_CR$clinical_barcodes,
+    'tobacco_smoking_history'
+  ]
+)
+
+## Now we will convert the numbers into the categories we are interested using an ifelse() cascade. The four groups we are interested in and their encodings are: 1::never smokers, 2::current smokers, 3::former smokers for > 15 years, and 4::former smokers for <= 15 years. Other values we will convert to NAs since they indicate ambiguous smoking statuses, though one might be of use, 5::former smokers of ambiguous time:
+expression_dataset_CR$final_tobacco_smoking_history <- ifelse(
+  expression_dataset_CR$raw_tobacco_smoking_history==1,
+  'Never Smoker',
+  ifelse(
+    expression_dataset_CR$raw_tobacco_smoking_history==2,
+    "Current Smoker",
+    ifelse(
+      expression_dataset_CR$raw_tobacco_smoking_history==3,
+      "Former Smoker > 15 years",
+      ifelse(
+        expression_dataset_CR$raw_tobacco_smoking_history==4,
+        "Former Smoker <= 15 years",
+        NA
+      )
+    )
+  )
+)
+
+methylation_dataset_CR$final_tobacco_smoking_history <- ifelse(
+  methylation_dataset_CR$raw_tobacco_smoking_history==1,
+  'Never Smoker',
+  ifelse(
+    methylation_dataset_CR$raw_tobacco_smoking_history==2,
+    "Current Smoker",
+    ifelse(
+      methylation_dataset_CR$raw_tobacco_smoking_history==3,
+      "Former Smoker > 15 years",
+      ifelse(
+        methylation_dataset_CR$raw_tobacco_smoking_history==4,
+        "Former Smoker <= 15 years",
+        NA
+      )
+    )
+  )
+)
+
+## Now let's remove the samples with NA values from the final_tobacco_smoking_history variable, since those are the samples with missing or unclear smoking history information. We will also record the number of samples which were removed due to a lack of this data, and also output that number to the console:
+expression_samples_before_smoking_history_info_removed <- nrow(expression_dataset_CR)
+
+methylation_samples_before_smoking_history_info_removed <- nrow(methylation_dataset_CR)
+
+expression_dataset_CR <- expression_dataset_CR[
+  !is.na(expression_dataset_CR$final_tobacco_smoking_history),
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  !is.na(methylation_dataset_CR$final_tobacco_smoking_history),
+]
+
+expression_dataset_CR <- expression_dataset_CR[
+  expression_dataset_CR$final_tobacco_smoking_history!='',
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  methylation_dataset_CR$final_tobacco_smoking_history!='',
+]
+
+expression_dataset_CR <- expression_dataset_CR[
+  expression_dataset_CR$final_tobacco_smoking_history!=' ',
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  methylation_dataset_CR$final_tobacco_smoking_history!=' ',
+]
+
+expression_samples_without_smoking_history_info <- (expression_samples_before_smoking_history_info_removed - nrow(expression_dataset_CR))
+
+methylation_samples_without_smoking_history_info <- (methylation_samples_before_smoking_history_info_removed - nrow(methylation_dataset_CR))
+
+paste(
+  "Number of expression samples removed due to lack of smoking history information:",
+  expression_samples_without_smoking_history_info,
+  sep=' '
+)
+
+paste(
+  "Number of methylation samples removed due to lack of smoking history information:",
+  methylation_samples_without_smoking_history_info,
+  sep=' '
+)
+
+## Let's clean up a bit by removing the number of samples before smoking history info removed count:
+rm(expression_samples_before_smoking_history_info_removed)
+
+rm(methylation_samples_before_smoking_history_info_removed)
+
+## Last, let's add race/ethnicity information, which is given in the 'race_list' column. We will wrap this in an as.character() function to ensure the data isn't imported as a factor (we can change it back into a factor of our own design in a later section of code):
+expression_dataset_CR$final_race_info <- as.character(
+  clinical[
+    expression_dataset_CR$clinical_barcodes,
+    'race_list'
+  ]
+)
+
+methylation_dataset_CR$final_race_info <- as.character(
+  clinical[
+    methylation_dataset_CR$clinical_barcodes,
+    'race_list'
+  ]
+)
+
+## Now let's remove the samples with missing values from the final_race_info variable, since those are the samples with missing or unclear race/ethnicity information. We will also record the number of samples which were removed due to a lack of this data, and also output that number to the console:
+expression_samples_before_race_info_removed <- nrow(expression_dataset_CR)
+
+methylation_samples_before_race_info_removed <- nrow(methylation_dataset_CR)
+
+expression_dataset_CR <- expression_dataset_CR[
+  !is.na(expression_dataset_CR$final_race_info),
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  !is.na(methylation_dataset_CR$final_race_info),
+]
+
+expression_dataset_CR <- expression_dataset_CR[
+  expression_dataset_CR$final_race_info!='',
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  methylation_dataset_CR$final_race_info!='',
+]
+
+expression_dataset_CR <- expression_dataset_CR[
+  expression_dataset_CR$final_race_info!=' ',
+]
+
+methylation_dataset_CR <- methylation_dataset_CR[
+  methylation_dataset_CR$final_race_info!=' ',
+]
+
+expression_samples_without_race_info <- (expression_samples_before_race_info_removed - nrow(expression_dataset_CR))
+
+methylation_samples_without_race_info <- (methylation_samples_before_race_info_removed - nrow(methylation_dataset_CR))
+
+paste(
+  "Number of expression samples removed due to lack of race information:",
+  expression_samples_without_race_info,
+  sep=' '
+)
+
+paste(
+  "Number of methylation samples removed due to lack of race information:",
+  methylation_samples_without_race_info,
+  sep=' '
+)
+
+## Let's clean up a bit by removing the number of samples before race info removed count:
+rm(expression_samples_before_race_info_removed)
+
+rm(methylation_samples_before_race_info_removed)
+
+## Now that we have all the final variables of interest added for the Cox regression analysis added, let's format the categorical ones as factors with proper reference levels. The reference group is the level of the factor to which each other level in the categorical variable is compared to.
+
+## To set a reference level I first consider if the categorical variable has an implicit order to it or not. Variables like gender and race don't, but variables like smoking status and cancer stage do (increasing smoking impact, more developed cancer). For the former where there is no implicit order, it is usually best to set the reference group to be that with the largest number in the variable. If the categorical variable does have an implicit order, I usually set it to be the closest to the "control group" or the group with no, or the least influence of the variable. As an example in this case, for smoking history the never smokers will be the reference group, and the stage I tumors will be the reference group for the cancer stage group.  Note that you still want a decent number of samples in your reference group - too few and you can end up with weird effect sizes, which won't directly affect the analysis, but can make it a bit hard to interpret at a glance. 
+
+## To view the total levels and numbers of each group in each variable you can run table() on the column.
+table(expression_dataset_CR$final_clinical_stage)
+
+table(methylation_dataset_CR$final_clinical_stage)
+
+table(expression_dataset_CR$final_gender)
+
+table(methylation_dataset_CR$final_gender)
+
+table(expression_dataset_CR$final_tobacco_smoking_history)
+
+table(methylation_dataset_CR$final_tobacco_smoking_history)
+
+table(expression_dataset_CR$final_race_info)
+
+table(methylation_dataset_CR$final_race_info)
+
+## Now let's use the above tables to create and re-level the factors. The level listed first will be the reference level:
+expression_dataset_CR$final_clinical_stage <- factor(
+  expression_dataset_CR$final_clinical_stage,
+  levels = c(
+    'Stage I',
+    'Stage II',
+    'Stage III',
+    'Stage IV'
+  )
+)
+
+methylation_dataset_CR$final_clinical_stage <- factor(
+  methylation_dataset_CR$final_clinical_stage,
+  levels = c(
+    'Stage I',
+    'Stage II',
+    'Stage III',
+    'Stage IV'
+  )
+)
+
+expression_dataset_CR$final_gender <- factor(
+  expression_dataset_CR$final_gender,
+  levels = c(
+    'FEMALE',
+    'MALE'
+  )
+)
+
+methylation_dataset_CR$final_gender <- factor(
+  methylation_dataset_CR$final_gender,
+  levels = c(
+    'FEMALE',
+    'MALE'
+  )
+)
+
+expression_dataset_CR$final_tobacco_smoking_history <- factor(
+  expression_dataset_CR$final_tobacco_smoking_history,
+  levels = c(
+    'Never Smoker',
+    'Former Smoker > 15 years',
+    'Former Smoker <= 15 years',
+    'Current Smoker'
+  )
+)
+
+methylation_dataset_CR$final_tobacco_smoking_history <- factor(
+  methylation_dataset_CR$final_tobacco_smoking_history,
+  levels = c(
+    'Never Smoker',
+    'Former Smoker > 15 years',
+    'Former Smoker <= 15 years',
+    'Current Smoker'
+  )
+)
+
+expression_dataset_CR$final_race_info <- factor(
+  expression_dataset_CR$final_race_info,
+  levels = c(
+    'WHITE',
+    'BLACK OR AFRICAN AMERICAN',
+    'ASIAN',
+    'AMERICAN INDIAN OR ALASKA NATIVE'
+  )
+)
+
+methylation_dataset_CR$final_race_info <- factor(
+  methylation_dataset_CR$final_race_info,
+  levels = c(
+    'WHITE',
+    'BLACK OR AFRICAN AMERICAN',
+    'ASIAN'
+  )
+)
+```
+
+Now to perform the Kaplan-Meier survival analyses, let's write functions that can then be applied over the expression or methylation data for given genes of interest to generate plots as well as tables of information for export:
+
+```{r}
+## Let's start by writing the function for Kaplan-Meier analysis on the expression data. This function will take a gene ENSG ID, a low and high threshold value, and an output path where the survival plots will be saved to. The raw data will be saved to a variable that the function is sapplied to:
+expression_KM_function <- function(
+  gene_of_interest,
+  high_thresh,
+  low_thresh,
+  output_directory
+){
+  
+  ## First thing is to identify samples that might be missing expression data, remove them from the analysis, and record the number of samples removed:
+  expression_samples_before_missing_expression_removed <- nrow(expression_dataset_KM)
+  
+  expression_dataset_KM_internal <- expression_dataset_KM[
+    as.vector(
+      !is.na(
+        expression_dataset_KM[gene_of_interest]
+      )
+    ),
+  ]
+  
+  expression_dataset_KM_internal <- expression_dataset_KM_internal[
+    as.vector(
+      expression_dataset_KM_internal[gene_of_interest]!=''
+    ),
+  ]
+  
+  expression_dataset_KM_internal <- expression_dataset_KM_internal[
+    as.vector(
+      expression_dataset_KM_internal[gene_of_interest]!=' '
+    ),
+  ]
+  
+  expression_samples_missing_expression_removed <- (
+    expression_samples_before_missing_expression_removed -
+    nrow(expression_dataset_KM_internal)
+  )
+  
+  ## Now calculate the quantile cutoffs based on the high_thresh and low_thresh values given:
+  high_cutoff_quantile= quantile(
+    as.vector(
+      expression_dataset_KM_internal[gene_of_interest]
+    ),
+    high_thresh,
+    na.rm= TRUE
+  )[1]
+
+  low_cutoff_quantile= quantile(
+    as.vector(
+      expression_dataset_KM_internal[gene_of_interest]
+    ),
+    low_thresh,
+    na.rm= TRUE
+  )[1]
+  
+  ## Determine if a sample is in the high or low grouping based on the cutoff values calculated. We wrap this in an as.vector() function as otherwise the output is given as an array/matrix, which makes things more complicated:
+  expression_dataset_KM_internal$sample_grouping <- as.vector(
+    ifelse(
+      as.vector(
+        expression_dataset_KM_internal[gene_of_interest]
+      ) >  high_cutoff_quantile,
+      "High",
+      ifelse(
+        as.vector(
+          expression_dataset_KM_internal[gene_of_interest]
+        ) <= low_cutoff_quantile,
+        "Low",
+        "Intermediate"
+      )
+    )
+  )
+  
+  ## Calculate the number of samples in each grouping:
+  sample_high_n <- nrow(
+    expression_dataset_KM_internal[
+      expression_dataset_KM_internal$sample_grouping=='High',
+    ]
+  )
+
+  sample_intermediate_n  <- nrow(
+    expression_dataset_KM_internal[
+      expression_dataset_KM_internal$sample_grouping=='Intermediate',
+    ]
+  )
+
+  sample_low_n  <- nrow(
+    expression_dataset_KM_internal[
+      expression_dataset_KM_internal$sample_grouping=='Low',
+    ]
+  )
+  
+  ## Let's also calculate the mean expression for each group:
+  sample_high_mean <- mean(
+    expression_dataset_KM_internal[
+      expression_dataset_KM_internal$sample_grouping=='High',
+      gene_of_interest
+    ],
+    na.rm= TRUE
+  )
+  
+  sample_intermediate_mean <- mean(
+    expression_dataset_KM_internal[
+      expression_dataset_KM_internal$sample_grouping=='Intermediate',
+      gene_of_interest
+    ],
+    na.rm= TRUE
+  )
+  
+  sample_low_mean <- mean(
+    expression_dataset_KM_internal[
+      expression_dataset_KM_internal$sample_grouping=='Low',
+      gene_of_interest
+    ],
+    na.rm= TRUE
+  )
+  
+  ## Now let's isolate samples that are only in our high or low groups:
+  expression_dataset_KM_internal_high_low <- expression_dataset_KM_internal[
+    !expression_dataset_KM_internal$sample_grouping=='Intermediate',
+  ]
+  
+  ## Calculate proportion of deceased individuals in each group
+  proportion_dead_high <- as.numeric(
+    nrow(
+      expression_dataset_KM_internal_high_low[
+        (expression_dataset_KM_internal_high_low$sample_grouping=='High' & expression_dataset_KM_internal_high_low$vital_status=='Dead'),
+      ]
+    ) /
+    nrow(
+      expression_dataset_KM_internal_high_low[
+        (expression_dataset_KM_internal_high_low$sample_grouping=='High'),
+      ]
+    )
+  )
+
+  proportion_dead_low <- as.numeric(
+    nrow(
+      expression_dataset_KM_internal_high_low[
+        (expression_dataset_KM_internal_high_low$sample_grouping=='Low' & expression_dataset_KM_internal_high_low$vital_status=='Dead'),
+      ]
+    ) /
+    nrow(
+      expression_dataset_KM_internal_high_low[
+        (expression_dataset_KM_internal_high_low$sample_grouping=='Low'),
+      ]
+    )
+  )
+  
+  ## Determine which group had greater proportion of fatalities and add it to the dataframe:
+  highest_dead_proportion_group <- ifelse(
+    proportion_dead_high > proportion_dead_low,
+    'high_expression_low_survival',
+    ifelse(
+      proportion_dead_high < proportion_dead_low,
+      'low_expression_low_survival',
+      'unclear'
+    )
+  )
+  
+  ## Now let's create the survival object using the survival package functions:
+  high_low_survival_object <- Surv(
+    expression_dataset_KM_internal_high_low$time,
+    ifelse(
+      expression_dataset_KM_internal_high_low$vital_status=='Alive',
+      FALSE,
+      TRUE
+    )
+  )
+  
+  ## Creating legend names for high/low expression groups:
+  legend_name_high <- paste(
+    gene_of_interest,
+    "high"
+  )
+
+  legend_name_low <- paste(
+    gene_of_interest,
+    "low"
+  )
+  
+  ## Perform the survival analysis.
+  ## This uses the combined expression grouping as the x variable and the survival data as the y variable to create a table with information about the test including chi-squared p-value:
+  survival_table <- survdiff(
+    high_low_survival_object ~ expression_dataset_KM_internal_high_low$sample_grouping
+  )
+  
+  ## Get the chi-squared test statistic from the analysis above:
+  survival_table_chi_squared <- survival_table$chisq
+
+  ## Calculating a p value based on the test statistic to get a precise p-value:
+  survival_pvalue <- as.numeric(
+    1 - pchisq(
+      abs(survival_table_chi_squared), 
+      df = 1
+    )
+  )
+  
+  ## Round the p-value on the graph to 3 digits:
+  survival_pvalue_formatted <- formatC(
+    survival_pvalue,
+    format='e',
+    digits=3
+  )
+  
+  ## Now create the plot title with gene ENSG and p-value included:
+  survival_title <- paste(
+    gene_of_interest,
+    "\nKaplan-Meier Survival analysis\nP = ",
+    survival_pvalue_formatted,
+    sep=''
+  )
+  
+  ## Create a title for the survival plot pdf, including the path to export the pdf to:
+  survival_plot_pdf_title <- paste(
+    output_directory,
+    gene_of_interest,
+    '_survival_plot.pdf',
+    sep=''
+  )
+  
+  ## Open a pdf for saving the plot:
+  pdf(survival_plot_pdf_title)
+  
+  ## Now actually create the survival plot sing a similar structure to what was used to generate the p-value:
+  plot(
+    survfit(
+      high_low_survival_object ~ expression_dataset_KM_internal_high_low$sample_grouping
+    ),
+
+    ## Color the lines (high in red first!):
+    col = c(
+      'red', 
+      'black'
+    ),
+
+    ## Add thickness to the lines:
+    lwd=3,
+
+    ## Use the title that was created earlier as the title of the plot:
+    main= survival_title,
+
+    ## Set titles of the x and y axis.
+    ## Note: TCGA measures survival in days as noted:
+    xlab="Time (days)",
+    ylab="Probability",
+
+    # Change axis size:
+    cex.axis=1,
+    cex.main=1.5,
+    cex.lab=1.25
+  )
+
+  ## Add a legend to the plot:
+  legend(
+
+    # Set X position of legend in graph. We will base this on the maximum time a patient's status has been confirmed, which is what the length of the X axis is based on:
+    x= (
+      max(expression_dataset_KM_internal_high_low$time, na.rm= TRUE)*(0.6)
+    ),
+
+    # Set Y position of legend in graph:
+    y= 1,
+
+    # Use the legend titles that were created earlier:
+    legend= c(
+      legend_name_high, 
+      legend_name_low
+    ),
+
+    # As above, use black for low and red for high:
+    col= c('red', 'black'),
+
+    # Coloring the text in the legend as well:
+    text.col= c('red', 'black'),
+
+    # Change the shape of the labels in the legend:
+    pch= 15
+  )
+
+  ## Close the plot:
+  dev.off()
+  
+  ## Finally, let's create a vector of useful information to save in a table:
+  output_vector <- c(
+    gene_of_interest,
+    expression_samples_missing_expression_removed,
+    high_cutoff_quantile,
+    low_cutoff_quantile,
+    sample_high_n,
+    sample_intermediate_n,
+    sample_low_n,
+    sample_high_mean,
+    sample_intermediate_mean,
+    sample_low_mean,
+    proportion_dead_high,
+    proportion_dead_low,
+    highest_dead_proportion_group,
+    survival_pvalue
+  )
+  
+  names(output_vector) <- c(
+    'gene_of_interest',
+    'samples_removed_lacking_expression_of_gene',
+    'high_group_cutoff_quantile',
+    'low_group_cutoff_quantile',
+    'high_group_count',
+    'intermediate_group_count',
+    'low_group_count',
+    'high_group_mean',
+    'intermediate_group_mean',
+    'low_group_mean',
+    'high_group_proportion_deceased',
+    'low_group_proportion_deceased',
+    'putative_survival_directionality',
+    'p_value_survival'
+  )
+  
+  ## Return the output vector:
+  return(output_vector)
+}
+
+## Let's create a similar function for the methylation of the probes of interest:
+methylation_KM_function <- function(
+  probe_of_interest,
+  high_thresh,
+  low_thresh,
+  output_directory
+){
+  
+  ## First thing is to identify samples that might be missing methylation data, remove them from the analysis, and record the number of samples removed:
+  methylation_samples_before_missing_methylation_removed <- nrow(methylation_dataset_KM)
+  
+  methylation_dataset_KM_internal <- methylation_dataset_KM[
+    as.vector(
+      !is.na(
+        methylation_dataset_KM[probe_of_interest]
+      )
+    ),
+  ]
+  
+  methylation_dataset_KM_internal <- methylation_dataset_KM_internal[
+    as.vector(
+      methylation_dataset_KM_internal[probe_of_interest]!=''
+    ),
+  ]
+  
+  methylation_dataset_KM_internal <- methylation_dataset_KM_internal[
+    as.vector(
+      methylation_dataset_KM_internal[probe_of_interest]!=' '
+    ),
+  ]
+  
+  methylation_samples_missing_methylation_removed <- (
+    methylation_samples_before_missing_methylation_removed -
+    nrow(methylation_dataset_KM_internal)
+  )
+  
+  ## Now calculate the quantile cutoffs based on the high_thresh and low_thresh values given:
+  high_cutoff_quantile= quantile(
+    as.vector(
+      methylation_dataset_KM_internal[probe_of_interest]
+    ),
+    high_thresh,
+    na.rm= TRUE
+  )[1]
+
+  low_cutoff_quantile= quantile(
+    as.vector(
+      methylation_dataset_KM_internal[probe_of_interest]
+    ),
+    low_thresh,
+    na.rm= TRUE
+  )[1]
+  
+  ## Determine if a sample is in the high or low grouping based on the cutoff values calculated. We wrap this in an as.vector() function as otherwise the output is given as an array/matrix, which makes things more complicated:
+  methylation_dataset_KM_internal$sample_grouping <- as.vector(
+    ifelse(
+      as.vector(
+        methylation_dataset_KM_internal[probe_of_interest]
+      ) >  high_cutoff_quantile,
+      "High",
+      ifelse(
+        as.vector(
+          methylation_dataset_KM_internal[probe_of_interest]
+        ) <= low_cutoff_quantile,
+        "Low",
+        "Intermediate"
+      )
+    )
+  )
+  
+  ## Calculate the number of samples in each grouping:
+  sample_high_n <- nrow(
+    methylation_dataset_KM_internal[
+      methylation_dataset_KM_internal$sample_grouping=='High',
+    ]
+  )
+
+  sample_intermediate_n  <- nrow(
+    methylation_dataset_KM_internal[
+      methylation_dataset_KM_internal$sample_grouping=='Intermediate',
+    ]
+  )
+
+  sample_low_n  <- nrow(
+    methylation_dataset_KM_internal[
+      methylation_dataset_KM_internal$sample_grouping=='Low',
+    ]
+  )
+  
+  ## Let's also calculate the mean methylation for each group:
+  sample_high_mean <- mean(
+    methylation_dataset_KM_internal[
+      methylation_dataset_KM_internal$sample_grouping=='High',
+      probe_of_interest
+    ],
+    na.rm= TRUE
+  )
+  
+  sample_intermediate_mean <- mean(
+    methylation_dataset_KM_internal[
+      methylation_dataset_KM_internal$sample_grouping=='Intermediate',
+      probe_of_interest
+    ],
+    na.rm= TRUE
+  )
+  
+  sample_low_mean <- mean(
+    methylation_dataset_KM_internal[
+      methylation_dataset_KM_internal$sample_grouping=='Low',
+      probe_of_interest
+    ],
+    na.rm= TRUE
+  )
+  
+  ## Now let's isolate samples that are only in our high or low groups:
+  methylation_dataset_KM_internal_high_low <- methylation_dataset_KM_internal[
+    !methylation_dataset_KM_internal$sample_grouping=='Intermediate',
+  ]
+  
+  ## Calculate proportion of deceased individuals in each group
+  proportion_dead_high <- as.numeric(
+    nrow(
+      methylation_dataset_KM_internal_high_low[
+        (methylation_dataset_KM_internal_high_low$sample_grouping=='High' & methylation_dataset_KM_internal_high_low$vital_status=='Dead'),
+      ]
+    ) /
+    nrow(
+      methylation_dataset_KM_internal_high_low[
+        (methylation_dataset_KM_internal_high_low$sample_grouping=='High'),
+      ]
+    )
+  )
+
+  proportion_dead_low <- as.numeric(
+    nrow(
+      methylation_dataset_KM_internal_high_low[
+        (methylation_dataset_KM_internal_high_low$sample_grouping=='Low' & methylation_dataset_KM_internal_high_low$vital_status=='Dead'),
+      ]
+    ) /
+    nrow(
+      methylation_dataset_KM_internal_high_low[
+        (methylation_dataset_KM_internal_high_low$sample_grouping=='Low'),
+      ]
+    )
+  )
+  
+  ## Determine which group had greater proportion of fatalities and add it to the dataframe:
+  highest_dead_proportion_group <- ifelse(
+    proportion_dead_high > proportion_dead_low,
+    'high_methylation_low_survival',
+    ifelse(
+      proportion_dead_high < proportion_dead_low,
+      'low_methylation_low_survival',
+      'unclear'
+    )
+  )
+  
+  ## Now let's create the survival object using the survival package functions:
+  high_low_survival_object <- Surv(
+    methylation_dataset_KM_internal_high_low$time,
+    ifelse(
+      methylation_dataset_KM_internal_high_low$vital_status=='Alive',
+      FALSE,
+      TRUE
+    )
+  )
+  
+  ## Creating legend names for high/low methylation groups:
+  legend_name_high <- paste(
+    probe_of_interest,
+    "high"
+  )
+
+  legend_name_low <- paste(
+    probe_of_interest,
+    "low"
+  )
+  
+  ## Perform the survival analysis.
+  ## This uses the combined methylation grouping as the x variable and the survival data as the y variable to create a table with information about the test including chi-squared p-value:
+  survival_table <- survdiff(
+    high_low_survival_object ~ methylation_dataset_KM_internal_high_low$sample_grouping
+  )
+  
+  ## Get the chi-squared test statistic from the analysis above:
+  survival_table_chi_squared <- survival_table$chisq
+
+  ## Calculating a p value based on the test statistic to get a precise p-value:
+  survival_pvalue <- as.numeric(
+    1 - pchisq(
+      abs(survival_table_chi_squared), 
+      df = 1
+    )
+  )
+  
+  ## Round the p-value on the graph to 3 digits:
+  survival_pvalue_formatted <- formatC(
+    survival_pvalue,
+    format='e',
+    digits=3
+  )
+  
+  ## Now create the plot title with probe ENSG and p-value included:
+  survival_title <- paste(
+    probe_of_interest,
+    "\nKaplan-Meier Survival analysis\nP = ",
+    survival_pvalue_formatted,
+    sep=''
+  )
+  
+  ## Create a title for the survival plot pdf, including the path to export the pdf to:
+  survival_plot_pdf_title <- paste(
+    output_directory,
+    probe_of_interest,
+    '_survival_plot.pdf',
+    sep=''
+  )
+  
+  ## Open a pdf for saving the plot:
+  pdf(survival_plot_pdf_title)
+  
+  ## Now actually create the survival plot sing a similar structure to what was used to proberate the p-value:
+  plot(
+    survfit(
+      high_low_survival_object ~ methylation_dataset_KM_internal_high_low$sample_grouping
+    ),
+
+    ## Color the lines (high in red first!):
+    col = c(
+      'red', 
+      'black'
+    ),
+
+    ## Add thickness to the lines:
+    lwd=3,
+
+    ## Use the title that was created earlier as the title of the plot:
+    main= survival_title,
+
+    ## Set titles of the x and y axis.
+    ## Note: TCGA measures survival in days as noted:
+    xlab="Time (days)",
+    ylab="Probability",
+
+    # Change axis size:
+    cex.axis=1,
+    cex.main=1.5,
+    cex.lab=1.25
+  )
+
+  ## Add a legend to the plot:
+  legend(
+
+    # Set X position of legend in graph. We will base this on the maximum time a patient's status has been confirmed, which is what the length of the X axis is based on:
+    x= (
+      max(methylation_dataset_KM_internal_high_low$time, na.rm= TRUE)*(0.6)
+    ),
+
+    # Set Y position of legend in graph:
+    y= 1,
+
+    # Use the legend titles that were created earlier:
+    legend= c(
+      legend_name_high, 
+      legend_name_low
+    ),
+
+    # As above, use black for low and red for high:
+    col= c('red', 'black'),
+
+    # Coloring the text in the legend as well:
+    text.col= c('red', 'black'),
+
+    # Change the shape of the labels in the legend:
+    pch= 15
+  )
+
+  ## Close the plot:
+  dev.off()
+  
+  ## Finally, let's create a vector of useful information to save in a table:
+  output_vector <- c(
+    probe_of_interest,
+    methylation_samples_missing_methylation_removed,
+    high_cutoff_quantile,
+    low_cutoff_quantile,
+    sample_high_n,
+    sample_intermediate_n,
+    sample_low_n,
+    sample_high_mean,
+    sample_intermediate_mean,
+    sample_low_mean,
+    proportion_dead_high,
+    proportion_dead_low,
+    highest_dead_proportion_group,
+    survival_pvalue
+  )
+  
+  names(output_vector) <- c(
+    'probe_of_interest',
+    'samples_removed_lacking_methylation_of_probe',
+    'high_group_cutoff_quantile',
+    'low_group_cutoff_quantile',
+    'high_group_count',
+    'intermediate_group_count',
+    'low_group_count',
+    'high_group_mean',
+    'intermediate_group_mean',
+    'low_group_mean',
+    'high_group_proportion_deceased',
+    'low_group_proportion_deceased',
+    'putative_survival_directionality',
+    'p_value_survival'
+  )
+  
+  ## Return the output vector:
+  return(output_vector)
+}
+
+## Now let's use the expression_KM_function and methylation_KM_function to save Kaplan-Meier survival plots to the specified 'path_for_files' directory, and create a dataframe of relevant results.
+
+## To do this, we will sapply the functions on each of the specified genes/probes, then transpose and convert the result to a dataframe so each gene/probe is a row with the data of interest in the columns.
+expression_KM_results_dataframe <- as.data.frame(
+  t(
+    sapply(
+      genes_of_interest,
+      FUN= expression_KM_function,
+      high_thresh= expression_KM_high_thresh,
+      low_thresh= expression_KM_low_thresh,
+      output_directory= path_for_files 
+    )
+  )
+)
+
+methylation_KM_results_dataframe <- as.data.frame(
+  t(
+    sapply(
+      probes_of_interest,
+      FUN= methylation_KM_function,
+      high_thresh= methylation_KM_high_thresh,
+      low_thresh= methylation_KM_low_thresh,
+      output_directory= path_for_files 
+    )
+  )
+)
+
+## Now save the dataframes to the specified 'path_for_files' directory
+write.table(
+  expression_KM_results_dataframe,
+  file= paste(
+    path_for_files,
+    'expression_Kaplain_Meier_survival_results.tsv',
+    sep=''
+  ),
+  quote= FALSE,
+  sep='\t',
+  row.names = FALSE
+)
+
+write.table(
+  methylation_KM_results_dataframe,
+  file= paste(
+    path_for_files,
+    'methylation_Kaplain_Meier_survival_results.tsv',
+    sep=''
+  ),
+  quote= FALSE,
+  sep='\t',
+  row.names = FALSE
+)
+```
+
+Now to perform the Cox regression survival analyses, let's write functions that can then be applied over the expression or methylation data for given genes of interest to generate tables of information for export:
+
+```{r}
+## Let's start by writing the function for Cox regression analyses on the expression and methylation data. This function only takes a gene ENSG ID or probe ID and the raw data will be saved to a variable that the function is sapplied to
+
+## Note, when building a model for a known gene, you'd typically use some sort of model selection method to decide which covariates to include (such as forward or backwards selection). However since I'm trying to examine multiple genes here, I'm just going to use the same stable of possible covariates on all genes, and then later we could consider looking at a more nuanced final model for genes that interest us.
+
+## Also at the moment, these functions don't generate any sort of survival plot. They also return three different types of p-values for the overall fits of the models (with genes and all covariates) as I'm not sure which metric is generally considered the most useful at this point.
+expression_CR_function <- function(
+  gene_of_interest
+){
+  
+  ## First thing is to identify samples that might be missing expression data, remove them from the analysis, and record the number of samples removed:
+  expression_samples_before_missing_expression_removed <- nrow(expression_dataset_CR)
+  
+  expression_dataset_CR_internal <- expression_dataset_CR[
+    as.vector(
+      !is.na(
+        expression_dataset_CR[gene_of_interest]
+      )
+    ),
+  ]
+  
+  expression_dataset_CR_internal <- expression_dataset_CR_internal[
+    as.vector(
+      expression_dataset_CR_internal[gene_of_interest]!=''
+    ),
+  ]
+  
+  expression_dataset_CR_internal <- expression_dataset_CR_internal[
+    as.vector(
+      expression_dataset_CR_internal[gene_of_interest]!=' '
+    ),
+  ]
+  
+  expression_samples_missing_expression_removed <- (
+    expression_samples_before_missing_expression_removed -
+    nrow(expression_dataset_CR_internal)
+  )
+  
+  ## First we need to convert vital_status to 1s or 2s, where 1:Alive (or censored) and 2: Dead:
+  expression_CR_vital_status_formatted <- ifelse(
+    expression_dataset_CR_internal$vital_status == 'Alive',
+    1,
+    2
+  )
+  
+  ## Let's start by creating a survival object using the patient status and time:
+  survival_object <- Surv(
+    expression_dataset_CR_internal$time,
+    expression_CR_vital_status_formatted
+  )
+  
+  ## Now we can use that survival_object along with the expression of our gene_of_interest and the cofactors of interest to do the Cox regression survival analysis. This might return an error about "Loglik converged before variable" but as far as I'm aware that is not a huge deal, and is likely due to small sample sizes for some of the races ('ASIAN' or 'AMERICAN INDIAN OR ALASKA NATIVE' probably). Might want to look into this further however:
+  cox_regression_results <- coxph(
+    as.formula(
+      paste(
+        'survival_object ~ ',
+        gene_of_interest,
+        ' + final_clinical_stage',
+        ' + final_gender',
+        ' + final_age',
+        ' + final_tobacco_smoking_history',
+        ' + final_race_info',
+        sep=''
+      )
+    ),
+    data= expression_dataset_CR_internal
+  )
+  
+  ## Now that the model has been fit, let's return the coefficients and p values for each of the variables, including the gene and covariates, as well as the overall p-value for the model. This can most easily be done by assembling a small for loop, since we will go through each level of each variable in order and grab results:
+  
+  ## Index an empty vector to store results, and add the gene's name and the number of samples missing gene expression to it:
+  return_vector <- c(
+    gene_of_interest,
+    expression_samples_missing_expression_removed
+  )
+  
+  ## Now let's create a numeric index for each of the levels of the various variables in the model and use a for loop to go through them and grab the coefficient and p-value from the model for each and add them to the return_vector:
+  for(i in 1:length(cox_regression_results$coefficients)){
+    
+    ## Create a vector with the coefficient, Hazard ratio (exp(coefficient)), and p-value for the ith variable/level for i:
+    i_vector <- c(
+      cox_regression_results$coefficients[i],
+      exp(cox_regression_results$coefficients[i]),
+      summary(cox_regression_results)$coefficients[,5][i]
+    )
+    
+    ## Add names of what info is included in the i_vector
+    names(i_vector) <- c(
+      paste(
+        names(cox_regression_results$coefficients[i]),
+        'coefficient',
+        sep='_'
+      ),
+      paste(
+        names(cox_regression_results$coefficients[i]),
+        'hazard_ratio',
+        sep='_'
+      ),
+      paste(
+        names(cox_regression_results$coefficients[i]),
+        'p_value',
+        sep='_'
+      )
+    )
+    
+    ## Now add the i_vector to the combined return_vector:
+    return_vector <- c(
+      return_vector,
+      i_vector
+    )
+  }
+  
+  ## Now let's add the three p-values for the overall model (Likelihood ratio test, Wald test, and Score (logrank) test) to the return_vector
+  return_vector <- c(
+    return_vector,
+    summary(cox_regression_results)$logtest[3],
+    summary(cox_regression_results)$waldtest[3],
+    summary(cox_regression_results)$sctest[3]
+  )
+  
+  names(return_vector) <- c(
+    'gene_of_interest',
+    'samples_removed_lacking_expression_of_gene',
+    names(return_vector)[
+      3:(
+        (length(cox_regression_results$coefficients)*3)+2
+      )
+    ],
+    'likelihood_ratio_test_p_value',
+    'wald_test_p_value',
+    'logrank_test_p_value'
+  )
+  
+  ## Now let's return that vector:
+  return(return_vector)
+}
+
+methylation_CR_function <- function(
+  probe_of_interest
+){
+  
+  ## First thing is to identify samples that might be missing methylation data, remove them from the analysis, and record the number of samples removed:
+  methylation_samples_before_missing_methylation_removed <- nrow(methylation_dataset_CR)
+  
+  methylation_dataset_CR_internal <- methylation_dataset_CR[
+    as.vector(
+      !is.na(
+        methylation_dataset_CR[probe_of_interest]
+      )
+    ),
+  ]
+  
+  methylation_dataset_CR_internal <- methylation_dataset_CR_internal[
+    as.vector(
+      methylation_dataset_CR_internal[probe_of_interest]!=''
+    ),
+  ]
+  
+  methylation_dataset_CR_internal <- methylation_dataset_CR_internal[
+    as.vector(
+      methylation_dataset_CR_internal[probe_of_interest]!=' '
+    ),
+  ]
+  
+  methylation_samples_missing_methylation_removed <- (
+    methylation_samples_before_missing_methylation_removed -
+    nrow(methylation_dataset_CR_internal)
+  )
+  
+  ## First we need to convert vital_status to 1s or 2s, where 1:Alive (or censored) and 2: Dead:
+  methylation_CR_vital_status_formatted <- ifelse(
+    methylation_dataset_CR_internal$vital_status == 'Alive',
+    1,
+    2
+  )
+  
+  ## Let's start by creating a survival object using the patient status and time:
+  survival_object <- Surv(
+    methylation_dataset_CR_internal$time,
+    methylation_CR_vital_status_formatted
+  )
+  
+  ## Now we can use that survival_object along with the methylation of our probe_of_interest and the cofactors of interest to do the Cox regression survival analysis. This might return an error about "Loglik converged before variable" but as far as I'm aware that is not a huge deal, and is likely due to small sample sizes for some of the races ('ASIAN' or 'AMERICAN INDIAN OR ALASKA NATIVE' probably). Might want to look into this further however:
+  cox_regression_results <- coxph(
+    as.formula(
+      paste(
+        'survival_object ~ ',
+        probe_of_interest,
+        ' + final_clinical_stage',
+        ' + final_gender',
+        ' + final_age',
+        ' + final_tobacco_smoking_history',
+        ' + final_race_info',
+        sep=''
+      )
+    ),
+    data= methylation_dataset_CR_internal
+  )
+  
+  ## Now that the model has been fit, let's return the coefficients and p values for each of the variables, including the probe and covariates, as well as the overall p-value for the model. This can most easily be done by assembling a small for loop, since we will go through each level of each variable in order and grab results:
+  
+  ## Index an empty vector to store results, and add the name of the probe and the number of samples missing probe methylation to it:
+  return_vector <- c(
+    probe_of_interest,
+    methylation_samples_missing_methylation_removed
+  )
+  
+  ## Now let's create a numeric index for each of the levels of the various variables in the model and use a for loop to go through them and grab the coefficient and p-value from the model for each and add them to the return_vector:
+  for(i in 1:length(cox_regression_results$coefficients)){
+    
+    ## Create a vector with the coefficient, Hazard ratio (exp(coefficient)), and p-value for the ith variable/level for i:
+    i_vector <- c(
+      cox_regression_results$coefficients[i],
+      exp(cox_regression_results$coefficients[i]),
+      summary(cox_regression_results)$coefficients[,5][i]
+    )
+    
+    ## Add names of what info is included in the i_vector
+    names(i_vector) <- c(
+      paste(
+        names(cox_regression_results$coefficients[i]),
+        'coefficient',
+        sep='_'
+      ),
+      paste(
+        names(cox_regression_results$coefficients[i]),
+        'hazard_ratio',
+        sep='_'
+      ),
+      paste(
+        names(cox_regression_results$coefficients[i]),
+        'p_value',
+        sep='_'
+      )
+    )
+    
+    ## Now add the i_vector to the combined return_vector:
+    return_vector <- c(
+      return_vector,
+      i_vector
+    )
+  }
+  
+    ## Now let's add the three p-values for the overall model (Likelihood ratio test, Wald test, and Score (logrank) test) to the return_vector
+  return_vector <- c(
+    return_vector,
+    summary(cox_regression_results)$logtest[3],
+    summary(cox_regression_results)$waldtest[3],
+    summary(cox_regression_results)$sctest[3]
+  )
+  
+  names(return_vector) <- c(
+    'probe_of_interest',
+    'samples_removed_lacking_methylation_of_probe',
+    names(return_vector)[
+      3:(
+        (length(cox_regression_results$coefficients)*3)+2
+      )
+    ],
+    'likelihood_ratio_test_p_value',
+    'wald_test_p_value',
+    'logrank_test_p_value'
+  )
+  
+  ## Now let's return that vector:
+  return(return_vector)
+}
+
+## Now let's use the expression_CR_function and methylation_CR_function to create a dataframe of relevant results.
+
+## To do this, we will sapply the functions on each of the specified genes/probes, then transpose and convert the result to a dataframe so each gene/probe is a row with the data of interest in the columns.
+expression_CR_results_dataframe <- as.data.frame(
+  t(
+    sapply(
+      genes_of_interest,
+      FUN= expression_CR_function
+    )
+  )
+)
+
+methylation_CR_results_dataframe <- as.data.frame(
+  t(
+    sapply(
+      probes_of_interest,
+      FUN= methylation_CR_function
+    )
+  )
+)
+
+## Now save the dataframes to the specified 'path_for_files' directory
+write.table(
+  expression_CR_results_dataframe,
+  file= paste(
+    path_for_files,
+    'expression_Cox_regression_survival_results.tsv',
+    sep=''
+  ),
+  quote= FALSE,
+  sep='\t',
+  row.names = FALSE
+)
+
+write.table(
+  methylation_CR_results_dataframe,
+  file= paste(
+    path_for_files,
+    'methylation_Cox_regression_survival_results.tsv',
+    sep=''
+  ),
+  quote= FALSE,
+  sep='\t',
+  row.names = FALSE
+)
+```
+
+Bonus section! We can use the created Cox regression datasets and do survival analysis using a random forest based model. Just as before we will write a function to build a random forest for the given genes/probes expression/methylation and export the important survival statistics for the model as a whole as well as the individual covariates. 
+
+```{r}
+## Let's start by writing the function for random forest survival analyses on the expression and methylation data. This function only takes a gene ENSG ID or probe ID and the raw data will be saved to a variable that the function is sapplied to
+
+## Also at the moment, these functions don't generate any sort of survival plot. 
+expression_RF_function <- function(
+  gene_of_interest
+){
+  
+  ## First thing is to identify samples that might be missing expression data, remove them from the analysis, and record the number of samples removed:
+  expression_samples_before_missing_expression_removed <- nrow(expression_dataset_CR)
+  
+  expression_dataset_RF_internal <- expression_dataset_CR[
+    as.vector(
+      !is.na(
+        expression_dataset_CR[gene_of_interest]
+      )
+    ),
+  ]
+  
+  expression_dataset_RF_internal <- expression_dataset_RF_internal[
+    as.vector(
+      expression_dataset_RF_internal[gene_of_interest]!=''
+    ),
+  ]
+  
+  expression_dataset_RF_internal <- expression_dataset_RF_internal[
+    as.vector(
+      expression_dataset_RF_internal[gene_of_interest]!=' '
+    ),
+  ]
+  
+  expression_samples_missing_expression_removed <- (
+    expression_samples_before_missing_expression_removed -
+    nrow(expression_dataset_RF_internal)
+  )
+  
+  ## First we need to convert vital_status to 1s or 2s, where 1:Alive (or censored) and 2: Dead:
+  expression_RF_vital_status_formatted <- ifelse(
+    expression_dataset_RF_internal$vital_status == 'Alive',
+    1,
+    2
+  )
+  
+  ## Let's start by creating a survival object using the patient status and time:
+  survival_object <- Surv(
+    expression_dataset_RF_internal$time,
+    expression_RF_vital_status_formatted
+  )
+  
+   ## Now we can use that survival_object along with the expression of our gene_of_interest and the cofactors of interest to do the random forest survival analysis:
+  random_forest_results <- ranger(
+    as.formula(
+      paste(
+        'survival_object ~ ',
+        gene_of_interest,
+        ' + final_clinical_stage',
+        ' + final_gender',
+        ' + final_age',
+        ' + final_tobacco_smoking_history',
+        ' + final_race_info',
+        sep=''
+      )
+    ),
+    data= expression_dataset_RF_internal,
+    importance= 'permutation',
+    splitrule = 'extratrees',
+    verbose= TRUE
+  )
+  
+  ## Now we can extract how important each variable is deemed to the model. I am not super well versed in this, but it seems that if the importance is positive, it is significant an extent (and indeed, if we compare to the cox regression results, the variables with positive importance here also seem to have significant p-values in the CR model).
+  
+  ## We will extract the importance variables and add them to a return vector along with the information we've included in other return_vectors for the other analyses:
+  return_vector <- c(
+    gene_of_interest,
+    expression_samples_missing_expression_removed,
+    random_forest_results$variable.importance,
+    (1-random_forest_results$prediction.error)
+  )
+  
+  names(return_vector) <- c(
+    'gene_of_interest',
+    'samples_removed_lacking_expression_of_gene',
+    paste(
+      names(random_forest_results$variable.importance),
+      'variable_importance',
+      sep='_'
+    ),
+    'Harrells c-index'
+  )
+  
+    ## Now let's return that vector:
+  return(return_vector)
+}
+
+methylation_RF_function <- function(
+  probe_of_interest
+){
+  
+  ## First thing is to identify samples that might be missing methylation data, remove them from the analysis, and record the number of samples removed:
+  methylation_samples_before_missing_methylation_removed <- nrow(methylation_dataset_CR)
+  
+  methylation_dataset_RF_internal <- methylation_dataset_CR[
+    as.vector(
+      !is.na(
+        methylation_dataset_CR[probe_of_interest]
+      )
+    ),
+  ]
+  
+  methylation_dataset_RF_internal <- methylation_dataset_RF_internal[
+    as.vector(
+      methylation_dataset_RF_internal[probe_of_interest]!=''
+    ),
+  ]
+  
+  methylation_dataset_RF_internal <- methylation_dataset_RF_internal[
+    as.vector(
+      methylation_dataset_RF_internal[probe_of_interest]!=' '
+    ),
+  ]
+  
+  methylation_samples_missing_methylation_removed <- (
+    methylation_samples_before_missing_methylation_removed -
+    nrow(methylation_dataset_RF_internal)
+  )
+  
+  ## First we need to convert vital_status to 1s or 2s, where 1:Alive (or censored) and 2: Dead:
+  methylation_RF_vital_status_formatted <- ifelse(
+    methylation_dataset_RF_internal$vital_status == 'Alive',
+    1,
+    2
+  )
+  
+  ## Let's start by creating a survival object using the patient status and time:
+  survival_object <- Surv(
+    methylation_dataset_RF_internal$time,
+    methylation_RF_vital_status_formatted
+  )
+  
+   ## Now we can use that survival_object along with the methylation of our probe_of_interest and the cofactors of interest to do the random forest survival analysis:
+  random_forest_results <- ranger(
+    as.formula(
+      paste(
+        'survival_object ~ ',
+        probe_of_interest,
+        ' + final_clinical_stage',
+        ' + final_gender',
+        ' + final_age',
+        ' + final_tobacco_smoking_history',
+        ' + final_race_info',
+        sep=''
+      )
+    ),
+    data= methylation_dataset_RF_internal,
+    importance= 'permutation',
+    splitrule = 'extratrees',
+    verbose= TRUE
+  )
+  
+  ## Now we can extract how important each variable is deemed to the model. I am not super well versed in this, but it seems that if the importance is positive, it is significant an extent (and indeed, if we compare to the cox regression results, the variables with positive importance here also seem to have significant p-values in the CR model).
+  
+  ## We will extract the importance variables and add them to a return vector along with the information we've included in other return_vectors for the other analyses:
+  return_vector <- c(
+    probe_of_interest,
+    methylation_samples_missing_methylation_removed,
+    random_forest_results$variable.importance,
+    (1-random_forest_results$prediction.error)
+  )
+  
+  names(return_vector) <- c(
+    'probe_of_interest',
+    'samples_removed_lacking_methylation_of_probe',
+    paste(
+      names(random_forest_results$variable.importance),
+      'variable_importance',
+      sep='_'
+    ),
+    'Harrells c-index'
+  )
+  
+    ## Now let's return that vector:
+  return(return_vector)
+}
+
+## Now let's use the expression_RF_function and methylation_RF_function to RFeate a dataframe of relevant results.
+
+## To do this, we will sapply the functions on each of the specified genes/probes, then transpose and convert the result to a dataframe so each gene/probe is a row with the data of interest in the columns.
+expression_RF_results_dataframe <- as.data.frame(
+  t(
+    sapply(
+      genes_of_interest,
+      FUN= expression_RF_function
+    )
+  )
+)
+
+methylation_RF_results_dataframe <- as.data.frame(
+  t(
+    sapply(
+      probes_of_interest,
+      FUN= methylation_RF_function
+    )
+  )
+)
+
+## Now save the dataframes to the specified 'path_for_files' directory
+write.table(
+  expression_RF_results_dataframe,
+  file= paste(
+    path_for_files,
+    'expression_random_forest_survival_results.tsv',
+    sep=''
+  ),
+  quote= FALSE,
+  sep='\t',
+  row.names = FALSE
+)
+
+write.table(
+  methylation_RF_results_dataframe,
+  file= paste(
+    path_for_files,
+    'methylation_random_forest_survival_results.tsv',
+    sep=''
+  ),
+  quote= FALSE,
+  sep='\t',
+  row.names = FALSE
+)
+```
+

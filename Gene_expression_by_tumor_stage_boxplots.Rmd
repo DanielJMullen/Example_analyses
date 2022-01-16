@@ -1,5 +1,5 @@
 ---
-title: "Expression Boxplots by Tumor Stage"
+title: "Gene_expression_by_tumor_stage_boxplots"
 author: "Daniel Mullen"
 date: "10/25/2021"
 output: html_document
@@ -45,14 +45,36 @@ if (!require('ggpubr')){
 }
 ```
 
-Next step is to load the TCGA LUAD dataset that will be used for this example:
+Now since we want to save graphs to the computer, we will need to specify a path for where to save them:
+
+```{r}
+## Set the path to a directory where you want the boxplot(s) generated to be saved
+path_for_file <- "C:/Users/Danie/Desktop/"
+
+## Make sure that the path_for_file ends in a '/'
+path_for_file <- ifelse(
+  substring(
+    path_for_file,
+    nchar(path_for_file),
+    nchar(path_for_file)
+  ) == '/',
+  path_for_file,
+  paste(
+    path_for_file,
+    '/',
+    sep=''
+  )
+)
+```
+
+Then load the TCGA LUAD dataset that will be used for this example:
 
 Please consult the TCGA_data_downloading_with_sample_matching_and_duplicate_removal script for information on how to 
-acquire the example datasets used in this tutorial. 
+acquire the example datasets used in this tutorial. In this case we will be using the unmatched sample dataset since we are only working with gene expression data and want to maximize sample sizes. 
 
 ```{r}
 ## Replace the path to the .rda here with the location you downloaded the .rda to on your system (that should be the path you set for the output_directory argument in the TCGA_data_downloading_with_sample_matching_and_duplicate_removal script). 
-load("C:/Users/Danie/Desktop/luad_expression_methylation_FPKMUQexpression_log2normalizedexpression_matchedtumorandnormalexpressionmethylation_deduplicatedtumor.rda")
+load("C:/Users/Danie/Desktop/luad_expression_methylation_FPKMUQexpression_log2normalizedexpression_nomatchingexpressionmethylation_deduplicatedtumor.rda")
 
 ## Set the rownames of the clinical data to be the bcr patient barcodes:
 ## This will help in grabbing clinical patient data and matching it to the expression data in a bit. 
@@ -146,7 +168,7 @@ expression_dataset$raw_clinical_stage_plus_normal_no_missing <- ifelse(
 
 ## Now the stage we get from the clinical data is very nuanced, with samples having individual substages, i.e. Stage IIIA vs. IIIB for example. To make the boxplot more understandable, we want to condense these down to just Stages I, II, III, IV, and the non-tumor samples.
 
-## To do this, I could do a large nested ifelse tree to sort each of the substages. However instead I have opted to manually create a conversion table which directly converts each of the possible values in the new raw_clinical_stage column to the simple stage values. You can see all values of raw_clinical_stage you'll need to account for by running unique(expression_dataset$raw_clinical_stage_plus_normal_no_missing).
+## To do this, I could do a large nested ifelse() tree to sort each of the substages. However instead I have opted to manually create a conversion table which directly converts each of the possible values in the new raw_clinical_stage column to the simple stage values. You can see all values of raw_clinical_stage you'll need to account for by running unique(expression_dataset$raw_clinical_stage_plus_normal_no_missing).
 stage_conversion_table <- data.frame(
   'raw_stages'= sort(
     unique(expression_dataset$raw_clinical_stage_plus_normal_no_missing),
@@ -207,7 +229,7 @@ expression_dataset_stage_present$final_clinical_stage_factor <- factor(
 )
 ```
 
-Now that we've set up the data frame containing the info for our boxplot, we will perform a one-way ANOVA to determine variance in expression between the different stages:
+Now that we've set up the data frame containing the info for our boxplot, we will perform a one-way ANOVA to examine the variance in expression between the different stages:
 
 ```{r}
 ## First step is to perform the ANOVA and save all the results to an object:
@@ -532,12 +554,9 @@ Lastly, instead of just getting the image of the plot and saving it manually, yo
 
 ```{r}
 
-## First let's come up with a descriptive name for the file. To do this you'll first have to define a path to the folder you want to save the plot to. For this, remember to include the trailing '/'
+## First let's come up with a descriptive name for the file. To do this you'll use the path to the folder you want to save the plot to that we generated earlier.
 
-path_for_file <- "C:/Users/Danie/Desktop/"
-
-## Now to name the file proper, let's include the ENSG of of the gene:
-
+## To name the file proper, let's include the ENSG of of the gene:
 file_name <- paste(
   gene_of_interest,
   'expression_by_stage_boxplot.pdf',

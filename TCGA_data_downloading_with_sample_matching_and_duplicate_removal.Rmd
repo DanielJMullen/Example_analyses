@@ -1,5 +1,5 @@
 ---
-title: "Downloading TCGA data with expression and methylation data matching and duplicate removal"
+title: "TCGA_data_downloading_with_sample_matching_and_duplicate_removal"
 author: "Daniel Mullen"
 date: "11/22/2021"
 output: html_document

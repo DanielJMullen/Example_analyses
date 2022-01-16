@@ -1,0 +1,353 @@
+---
+title: "Gene_expression_by_sample_type_boxplots"
+author: "Daniel Mullen"
+date: "12/15/2021"
+output: html_document
+---
+
+Creating boxplots with ggplot2
+
+This will create boxplots with the gene expression of user-selected genes across tumor vs normal samples from The Cancer Genome Atlas. This is a similar analysis to the one detailed in Gene_expression_by_tumor_stage_boxplots.rmd. However this will include a Student's t-test rather than ANOVA comparison, and also includes functionality to generate plots for multiple genes at once, rather than requiring the specification of a single gene. 
+
+First step is to install necessary packages:
+
+Using the if(!require()) notation for this should only install the packages if they aren't already installed. This should also call library() on each package as well.
+
+```{r}
+## Load BiocManager to install packages from Bioconductor
+## This will allow you to download other packages from Bioconductor:
+
+if (!require("BiocManager", quietly = TRUE)){
+  
+  install.packages("BiocManager")
+  
+}
+
+## Load ggplot2
+## This is the main graphing function you will be using - it can be a bit complex to master but gives you the most control over its presentation:
+if (!require('ggplot2')){
+  
+  BiocManager::install("ggplot2")
+}
+
+## Load EnvStats
+## EnvStats contains the stat_n_text function for ggplot2 to display group sizes in the boxplot:
+if (!require('EnvStats')){
+  
+  BiocManager::install("EnvStats")
+}
+```
+
+Now since we want to save graphs to the computer, we will need to specify a path for where to save them:
+
+```{r}
+## Set the path to a directory where you want the boxplots for each of the genes saved:
+path_for_files <- "C:/Users/Danie/Desktop/"
+
+## Make sure that the path_for_file ends in a '/'
+path_for_files <- ifelse(
+  substring(
+    path_for_files,
+    nchar(path_for_files),
+    nchar(path_for_files)
+  ) == '/',
+  path_for_files,
+  paste(
+    path_for_files,
+    '/',
+    sep=''
+  )
+)
+```
+
+Then, load the TCGA LUAD dataset that will be used for this example:
+
+Please consult the TCGA_data_downloading_with_sample_matching_and_duplicate_removal script for information on how to 
+acquire the example datasets used in this tutorial. In this case we will be using the unmatched sample dataset since we are only working with gene expression data and want to maximize sample sizes. 
+
+```{r}
+## Replace the path to the .rda here with the location you downloaded the .rda to on your system (that should be the path you set for the output_directory argument in the TCGA_data_downloading_with_sample_matching_and_duplicate_removal script). 
+load("C:/Users/Danie/Desktop/luad_expression_methylation_FPKMUQexpression_log2normalizedexpression_nomatchingexpressionmethylation_deduplicatedtumor.rda")
+
+## Set the rownames of the clinical data to be the bcr patient barcodes:
+## This will help in grabbing clinical patient data and matching it to the expression data in a bit.
+rownames(clinical) <- clinical$bcr_patient_barcode
+```
+
+Now let's specify the genes of interest for our boxplots:
+
+This is given by the genes' ENSG IDs (in the form of ENSG###########) in a vector. See my script on convert gene ENSGs to gene names and vice versa.
+
+```{r}
+## List the ENSG IDs for the genes of interest. ENSG00000111206 is FOXM1, ENSG00000101057 is MYBL2, and ENSG00000115163 is CENPA.
+genes_of_interest <- c(
+  'ENSG00000111206',
+  'ENSG00000101057',
+  'ENSG00000115163'
+)
+
+```
+
+Now to create a boxplot, it is essential to construct a dataframe with each of the samples in the rows and all of the data used in our boxplot in the columns, including the expression values for our genes of interest as well as the tumor vs normal grouping:
+
+```{r}
+## Let's start by getting the sample type (tumor vs normal) info for each sample as well as each sample's TCGA barcode.
+expression_dataset <- data.frame(
+  'TCGA_barcodes'= c(
+    colnames(expDataT),
+    colnames(expDataN)
+  ),
+  'sample_type'= c(
+    rep(
+      'Tumor',
+      ncol(expDataT)
+    ),
+    rep(
+      'Normal',
+      ncol(expDataN)
+    )
+  ),
+  stringsAsFactors = FALSE
+)
+
+## Now for each gene in the vector, get it's expression and and them to the dataset with a for loop.
+for(gene in genes_of_interest){
+  
+  ## For each gene, get it's expression from the tumor then normal samples and add it as a column to the dataframe with the ENSG ID of the gene.
+  expression_dataset[gene] <- c(
+    unname(
+      unlist(
+        expDataT[
+          gene,
+        ]
+      )
+    ),
+    unname(
+      unlist(
+        expDataN[
+          gene,
+        ]
+      )
+    )
+  )
+}
+
+## Finally we want to convert the sample type into a factor to make sure the levels are ordered correctly in the plot (display normal values first, then the tumor values).
+expression_dataset$sample_type_factor <- factor(
+  expression_dataset$sample_type,
+  levels= c(
+    'Normal',
+    'Tumor'
+  )
+)
+```
+
+Now that we've set up the data frame containing the info for our boxplot, we will perform Student's t-tests to examine the variance in expression between the tumor and normal samples for our gene of interest:
+
+```{r}
+## Since we want to calculate a p-value for each of the genes of interest, let's write a function to calculate the t-test p-value given the ENSG of the gene as an input.
+t_test_p_value_calculator <- function(gene_ENSG){
+  
+  ## Do the t-test comparing the data for the gene of interest from the Tumor and Normal samples and return the p-value.
+  return(
+    t.test(
+      expression_dataset[
+        expression_dataset$sample_type=='Tumor',
+        gene_ENSG
+      ],
+       expression_dataset[
+        expression_dataset$sample_type=='Normal',
+        gene_ENSG
+      ]
+    )$p.value
+  )
+  
+}
+
+## While we are at it, let's also do a function that can create a table of group 
+## means and standard deviations.
+group_means_sd_calculator <- function(gene_ENSG){
+  
+  ## Calculate the normal mean and sd.
+  normal_mean <- mean(
+    expression_dataset[
+      expression_dataset$sample_type=='Normal',
+      gene_ENSG
+    ]
+  )
+  
+  normal_sd <- sd(
+    expression_dataset[
+      expression_dataset$sample_type=='Normal',
+      gene_ENSG
+    ]
+  )
+  
+  ## Calculate the tumor mean and sd.
+  tumor_mean <- mean(
+    expression_dataset[
+      expression_dataset$sample_type=='Tumor',
+      gene_ENSG
+    ]
+  )
+  
+  tumor_sd <- sd(
+    expression_dataset[
+      expression_dataset$sample_type=='Tumor',
+      gene_ENSG
+    ]
+  )
+  
+  ## Return the values with names of each.
+  return_vector <- c(
+    normal_mean,
+    tumor_mean,
+    normal_sd,
+    tumor_sd
+  )
+  
+  names(return_vector) <- c(
+    'Normal_mean',
+    'Tumor_mean',
+    'Normal_SD',
+    'Tumor_SD'
+  )
+  
+  return(return_vector)
+}
+
+## Now let's sapply the function to calculate a t-test p-value for each gene. I use sapply here because otherwise it will only return the p-value for one of the genes at a time, rather than listing the p-value for each of the genes at once.
+t_test_p_values <- sapply(
+  genes_of_interest,
+  t_test_p_value_calculator
+)
+
+## Then, format the p-values to list them in scientific notation and round them to 3 digits and display them.
+t_test_p_values_formatted <- formatC(
+  t_test_p_values,
+  format = "e",
+  digits = 3
+)
+
+t_test_p_values_formatted
+
+## Now let's use the group_means_sd_calculator function to generate a table of normal and tumor means and standard deviations for each gene:
+
+## To do this, we will sapply the function on each gene, then transpose and convert the result to a dataframe so each gene is a row with Normal/Tumor means and SDs as columns, and then we will display the results.
+normal_tumor_means_and_sds <- as.data.frame(
+  t(
+    sapply(
+      genes_of_interest,
+      group_means_sd_calculator
+    )
+  )
+)
+
+normal_tumor_means_and_sds
+```
+
+
+Now we will  specify colors for each of the groups to display in the boxplot.
+
+```{r}
+## I generally like using a blue color for normal samples, and a reddish color for tumor samples:
+color_fill <- c(
+  'Normal'='dodgerblue3',
+  'Tumor'='red3'
+)
+```
+
+Finally we can move on to actually creating the plot(s). 
+
+```{r}
+## Now to generate plots for all the genes. To do this I will use a for loop since I'll be looping through the genes of interest as well as the formatted t-test p-values. Because of this I will also be using a numbered index, rather than invoking the gene names themselves. If you wanted to do this over numerous genes, consider writing this as a function rather than a for loop to increase speed by sapplying it:
+
+## This will both plot the plot and save a copy 
+for(
+  i in 1:length(genes_of_interest)
+){
+  
+  ## First let's index a basic plot that we can build on for each gene:
+  
+  ## The first part in this code designates our dataframe of information to look at for info to create the plot, with our y variable being the gene's expression (obtained by grabbing the i-th object in the genes_of_interest vector), and the x variable being the sample type factor.
+  
+  ## geom_boxplot() helps define the coloration of the plots, also designating the sample type factor to look at for how to color it.
+  expression_plot <- ggplot(
+    expression_dataset,
+    aes(
+      x = sample_type_factor, 
+      y = eval(parse(text = genes_of_interest[i]))
+    )
+  ) +
+  geom_boxplot(
+    aes(fill = sample_type_factor)
+  )
+  
+  ## Now to the expression plot we'll add a title, noting the ENSG ID of the gene on the first line, as desigated by the gene ENSG in the ith position in the for loop, and the t-test p-value (rounded) that we calculated earlier on the second line. The ylab and xlab parameters will label the X and Y axes. However the size and color of these labels are adjsted by the axis.title arguments near the end of this block of code. 
+
+  ## guides(fill='none') prevents R from showing a legend of the groups to the right of the plot. I do not like including this legend because the groups are already labelled in the plot, so it just takes up space. 
+
+  ## As discussed previously, we can use the stat_pvalue_manual function to display the tukey_comparisons_of_interest dataset we made earlier. 
+
+  ## stat_n_text simply includes little boxes with n= the number of samples in each group below each group's boxplot. 
+
+  ## theme_bw() changes the plot to greyscale color
+
+  ## scale_fill_manual() lets us change the color of each group to the colors we specified earlier with color_fill.
+
+  ## Finally theme() has a number of parameters that can be adjusted. I use it to adjust the text size and color of the title, axis, and sub axis labels. I also turn off the major and minor gridlines by using element_blank() for those arguments. 
+
+  ## For these plots, no plot will be projected. Instead a pdf of the size specified in the subsequent lines of code after this section will be created of the plot below.
+  expression_plot_updated <- expression_plot +
+    ggtitle(
+      paste(
+        genes_of_interest[i],
+        ' Expression\n',
+        "Tumor vs. Normal p= ",
+        t_test_p_values_formatted[i],
+        sep=''
+      )
+    ) +
+    ylab("Gene expression [log2(FPKM-UQ)]") +
+    xlab("Sample Grouping") +
+    guides(fill='none') +
+    stat_n_text(
+      geom='label',
+      size=6
+    ) +
+    theme_bw() +
+    scale_fill_manual(values=color_fill) +
+    theme(
+      plot.title = element_text(hjust=0.5, size=20),
+      panel.border = element_rect(colour = 'black', fill=NA, size=1),
+      axis.title.x = element_text(size=20, colour = 'black'),
+      axis.title.y = element_text(size=20, colour = 'black'),
+      axis.text.x = element_text(size=16, colour = 'black'),
+      axis.text.y = element_text(size=16, colour = 'black'),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+  
+  ## Now let's create a file name and path that we will save the pdf to. We will do that by taking the path_for_files set at the beginning of the script and creating a file name with the gene ENSG:
+  pdf_output_path <- paste(
+    path_for_files,
+    genes_of_interest[i],
+    '_tumor_vs_normal_expression_boxplot.pdf',
+    sep=''
+  )
+  
+  ## Now let's use the path to open a pdf with a height of 7 and a length of 10 inches. You can also set the size to pixels:
+  pdf(
+    pdf_output_path,
+    height= 7,
+    width= 10
+  )
+  
+  ## Now do the updated plot:
+  plot(expression_plot_updated)
+  
+  ## Close the plot:
+  dev.off()
+}
+```
+
